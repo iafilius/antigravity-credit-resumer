@@ -1,0 +1,85 @@
+{
+  "name": "antigravity-credit-resumer",
+  "displayName": "Antigravity Credit Auto-Resumer",
+  "description": "Automatically resumes Antigravity AI Cascades when credits refill and manages model switching settings.",
+  "version": "0.1.0",
+  "publisher": "arjan",
+  "engines": {
+    "vscode": "^1.68.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arjanfilius/antigravity-credit-resumer.git"
+  },
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Antigravity Credit Resumer",
+      "properties": {
+        "antigravityCreditResumer.modelSelectionMode": {
+          "type": "string",
+          "default": "stick",
+          "enum": [
+            "stick",
+            "auto"
+          ],
+          "markdownDescription": "Configure model selection behavior when credits run out.\n- `stick`: Keep the user-selected model and wait for its credits to refresh.\n- `auto`: Automatically cycle through available models with positive credit quota."
+        },
+        "antigravityCreditResumer.resumePrompt": {
+          "type": "string",
+          "default": "continue",
+          "description": "The prompt string to submit to the active cascade when resuming (e.g. 'continue' or 'resume')."
+        },
+        "antigravityCreditResumer.checkInterval": {
+          "type": "integer",
+          "default": 60,
+          "description": "Frequency (in seconds) to check credit status."
+        },
+        "antigravityCreditResumer.debugLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable detailed debug logging to the 'Antigravity Credit Resumer (Debug)' channel."
+        },
+        "antigravityCreditResumer.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show credit status indicator in the bottom status bar."
+        },
+        "antigravityCreditResumer.showNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show toast notifications when the resumer auto-continues active cascades or switches models."
+        },
+        "antigravityCreditResumer.persistentLogging": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable persistent logging and history files inside the active workspace under `.logs/`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --minify",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "test:unit": "vitest run",
+    "test:integration": "npx tsc && node ./out/tests/run-integration.js",
+    "test": "npm run test:unit && npm run test:integration"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^18.11.18",
+    "@types/vscode": "^1.68.0",
+    "@vscode/test-electron": "^3.0.0",
+    "esbuild": "^0.17.5",
+    "mocha": "^11.7.6",
+    "typescript": "^4.9.4",
+    "vitest": "^4.1.9"
+  }
+}

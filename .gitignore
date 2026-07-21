@@ -1,0 +1,20 @@
+# Dependency directories
+node_modules/
+
+# Build outputs
+dist/
+out/
+*.vsix
+
+# Logs and local history
+.logs/
+.arjan/
+.openspec/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Subfolder publishing repository
+publish/
+

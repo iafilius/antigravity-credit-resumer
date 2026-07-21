@@ -1,0 +1,82 @@
+# Antigravity Credit Auto-Resumer
+
+An extension for Antigravity IDE (and VS Code) that monitors your AI model credits locally and automatically resumes active conversations/cascades when credits are refilled or switches to other available models.
+
+---
+
+## 1. What It Does
+
+1.  **Process Discovery**: Automatically scans local processes to find running instances of the Antigravity Language Server and extracts their CSRF tokens.
+2.  **Port Mapping**: Discovers the dynamic local HTTPS/gRPC ports that the target processes are listening on.
+3.  **Credit Status Monitoring**: Queries the local Connect RPC `/GetUserStatus` endpoint to monitor prompt/flow credits and individual model quotas.
+4.  **Auto-Resume Cascade**: Automatically sends `"continue"` (or your custom prompt) to the most active/recently updated cascade in your workspace when credits reload.
+5.  **Smart Model Switching (Optional)**: Automatically switches to other recommended models that still have remaining credits, ensuring optimal utilization of your quotas.
+6.  **Clean Lifecycle**: Runs entirely in-memory and cleanly terminates all background timers and Output Channels upon extension unload, leaving no trace on disk.
+
+---
+
+## 2. Configuration Settings
+
+You can configure these settings in the IDE Settings editor:
+
+*   **`antigravityCreditResumer.modelSelectionMode`** (`string`):
+    *   `stick` (Default): Stay with your currently selected model and wait for its credits to refresh.
+    *   `auto`: Automatically switch to any other recommended model with positive credits when the current model runs out.
+*   **`antigravityCreditResumer.resumePrompt`** (`string`):
+    *   `continue` (Default): The standard message that Antigravity quickly understands.
+    *   *Custom*: Any text prompt you wish to submit when resuming (e.g., `"resume"`).
+*   **`antigravityCreditResumer.checkInterval`** (`integer`):
+    *   Frequency in seconds to query local credits (Default: `60`).
+*   **`antigravityCreditResumer.debugLogging`** (`boolean`):
+    *   Enable detailed logging (Default: `false`).
+    *   *Where to find logs*: Open the bottom dock in the IDE, click on the **Output** tab (next to Terminal), and select **"Antigravity Credit Resumer"** from the drop-down menu in the top-right corner of that panel.
+*   **`antigravityCreditResumer.showStatusBar`** (`boolean`):
+    *   Show credit status indicator in the bottom status bar (Default: `true`).
+*   **`antigravityCreditResumer.showNotifications`** (`boolean`):
+    *   Show toast notification actions when a cascade is auto-continued or model is switched (Default: `true`).
+
+---
+
+## 3. Local Installation & Testing
+
+To build and run the extension locally:
+
+### Step 1: Build & Package
+Run the following command in the extension directory to install dependencies, compile, and package the extension into a `.vsix` file:
+```bash
+make package
+```
+This generates a package file named `antigravity-credit-resumer-0.1.0.vsix` in your root directory.
+
+### Step 2: Install in the IDE
+You can install the packaged extension directly using the Makefile:
+```bash
+make install-ide
+```
+Alternatively, to install it manually through the UI:
+1.  Open the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows/Linux).
+2.  Search for and run: **`Extensions: Install from VSIX...`**
+3.  Choose the generated `antigravity-credit-resumer-0.1.0.vsix` file.
+4.  Reload the window to activate.
+
+---
+
+## 4. Registering & Publishing on Open VSX
+
+Open VSX is an open-source alternative registry to the Microsoft VS Code Marketplace.
+
+### Step 1: Create an Account & Namespace
+1.  Go to [open-vsx.org](https://open-vsx.org/) and log in/register using GitHub, GitLab, or Google.
+2.  Navigate to your profile and create a **Namespace** (e.g., `arjan`). The namespace must match the `publisher` field in your `package.json`.
+    *   *Note*: Ensure that the `publisher` field in `package.json` matches your registered namespace.
+
+### Step 2: Generate an Access Token
+1.  In your Open VSX profile page, go to **Access Tokens**.
+2.  Generate a new token with write access for publishing. Save the token securely.
+
+### Step 3: Publish
+You can publish the extension directly using the Makefile:
+```bash
+make publish TOKEN=<YOUR_OPEN_VSX_TOKEN>
+```
+This automatically packages the extension and uploads the resulting `.vsix` file to the Open VSX registry.
