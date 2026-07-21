@@ -47,7 +47,7 @@ sync: build
 	fi
 	@if ! git -C publish remote | grep -q origin; then \
 		echo "Setting remote origin to GitHub..." ; \
-		git -C publish remote add origin https://github.com/arjanfilius/antigravity-credit-resumer.git; \
+		git -C publish remote add origin https://github.com/iafilius/antigravity-credit-resumer.git; \
 	fi
 	@echo "=== 2. Syncing clean production files ==="
 	@cp .gitignore package.json package-lock.json tsconfig.json esbuild.js README.md LICENSE Makefile publish/
