@@ -1,6 +1,8 @@
 # Antigravity Credit Auto-Resumer
 
-An extension for Antigravity IDE (and VS Code) that monitors your AI model credits locally and, depending on your choice of settings, waits for credits to refresh and then resumes, or automatically switches to another model with available credits and then resumes active conversations/cascades.
+An extension for Antigravity IDE (and VS Code) that monitors your AI model credits locally and automatically resumes active conversations. Designed to **eliminate manual AI babysitting** during long-running execution jobs—allowing your tasks to keep progressing automatically while you sleep or focus on other work.
+
+Depending on your choice of settings, it either **waits for credit quotas to refresh and then resumes**, or **automatically switches to another model with available credits and resumes** immediately.
 
 ---
 
