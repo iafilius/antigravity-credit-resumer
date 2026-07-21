@@ -1,6 +1,6 @@
 # Antigravity Credit Auto-Resumer
 
-An extension for Antigravity IDE (and VS Code) that monitors your AI model credits locally and automatically resumes active conversations/cascades when credits are refilled or switches to other available models.
+An extension for Antigravity IDE (and VS Code) that monitors your AI model credits locally and, depending on your choice of settings, waits for credits to refresh and then resumes, or automatically switches to another model with available credits and then resumes active conversations/cascades.
 
 ---
 
@@ -9,8 +9,8 @@ An extension for Antigravity IDE (and VS Code) that monitors your AI model credi
 1.  **Process Discovery**: Automatically scans local processes to find running instances of the Antigravity Language Server and extracts their CSRF tokens.
 2.  **Port Mapping**: Discovers the dynamic local HTTPS/gRPC ports that the target processes are listening on.
 3.  **Credit Status Monitoring**: Queries the local Connect RPC `/GetUserStatus` endpoint to monitor prompt/flow credits and individual model quotas.
-4.  **Auto-Resume Cascade**: Automatically sends `"continue"` (or your custom prompt) to the most active/recently updated cascade in your workspace when credits reload.
-5.  **Smart Model Switching (Optional)**: Automatically switches to other recommended models that still have remaining credits, ensuring optimal utilization of your quotas.
+4.  **Auto-Resume Cascade**: Depending on your chosen settings (`stick` mode), waits for model credits to refresh and then automatically sends `"continue"` (or your custom prompt) to resume active conversations/cascades.
+5.  **Smart Model Switching**: In `auto` mode, automatically switches to another model with available credits when the current model is exhausted, and then resumes the active cascade immediately.
 6.  **Clean Lifecycle**: Runs entirely in-memory and cleanly terminates all background timers and Output Channels upon extension unload, leaving no trace on disk.
 
 ---
