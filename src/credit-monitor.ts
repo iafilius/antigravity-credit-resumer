@@ -101,12 +101,19 @@ function queryGetUserStatus(port: number, csrfToken: string): Promise<any | null
 
 function parseModelQuotas(status: any): ModelQuotaInfo[] {
   const models: ModelQuotaInfo[] = [];
+  const seenKeys = new Set<string>();
   const configs = status?.userStatus?.cascadeModelConfigData?.clientModelConfigs || [];
 
   for (const config of configs) {
     const label = config.label || '';
     const model = config.modelOrAlias?.model || '';
     const quotaInfo = config.quotaInfo;
+
+    const dedupeKey = (label || model).trim();
+    if (!dedupeKey || seenKeys.has(dedupeKey)) {
+      continue;
+    }
+    seenKeys.add(dedupeKey);
 
     models.push({
       label,
@@ -118,3 +125,4 @@ function parseModelQuotas(status: any): ModelQuotaInfo[] {
 
   return models;
 }
+

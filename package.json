@@ -2,7 +2,7 @@
   "name": "antigravity-credit-resumer",
   "displayName": "Antigravity Credit Auto-Resumer",
   "description": "Automatically resumes Antigravity AI Cascades when credits refill and manages model switching settings.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "arjan",
   "engines": {
     "vscode": "^1.68.0"

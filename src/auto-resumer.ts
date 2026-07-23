@@ -90,7 +90,7 @@ export class AutoResumer {
         this.statusBarItem.text = `$(credit-card) AGY: ${credits.availablePromptCredits}p/${credits.availableFlowCredits}a cr (${shortModelName}: ${quotaPercentageText})`;
         
         const quotaPercentage = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(1)}%` : 'Unlimited';
-        const resetStr = currentModelQuota?.resetTime ? formatResetTime(currentModelQuota.resetTime) : 'N/A';
+        const resetStr = currentModelQuota?.resetTime ? formatResetTime(currentModelQuota.resetTime, currentModelQuota.remainingFraction) : (currentModelQuota?.remainingFraction !== undefined && currentModelQuota.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
 
         // Construct list of all model quotas
         const modelQuotasLines = credits.models.map(m => {
@@ -100,7 +100,7 @@ export class AutoResumer {
           let detailStr = 'Unlimited';
           if (m.remainingFraction !== undefined) {
             const pct = (m.remainingFraction * 100).toFixed(1);
-            const resetVal = m.resetTime ? formatResetTime(m.resetTime) : 'N/A';
+            const resetVal = m.resetTime ? formatResetTime(m.resetTime, m.remainingFraction) : (m.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
             detailStr = `${pct}% (refills ${resetVal})`;
           }
           return `• ${labelStr}: ${detailStr}`;
@@ -162,12 +162,30 @@ export class AutoResumer {
       }
 
       if (mode === 'auto') {
-        // Find another model with remaining credits
-        const alternateModel = credits.models.find(m => {
+        // Find candidate models with remaining credits (> 5%)
+        const candidateModels = credits.models.filter(m => {
           if (m.model === currentModelId) return false;
           if (m.remainingFraction === undefined) return true; // Assume unlimited/no limit info
           return m.remainingFraction > 0.05; // Has at least 5% credits
         });
+
+        // Sort candidates:
+        // 1. Same family match (e.g. Flash -> Flash, Pro -> Pro, Sonnet -> Sonnet)
+        // 2. Highest remainingFraction
+        const currentFamily = getShortModelLabel(currentModelQuota?.label || currentModelId).split(' ').pop() || '';
+        candidateModels.sort((a, b) => {
+          const aFamily = getShortModelLabel(a.label || a.model).split(' ').pop() || '';
+          const bFamily = getShortModelLabel(b.label || b.model).split(' ').pop() || '';
+          const aMatch = aFamily && currentFamily && aFamily === currentFamily ? 1 : 0;
+          const bMatch = bFamily && currentFamily && bFamily === currentFamily ? 1 : 0;
+          if (aMatch !== bMatch) return bMatch - aMatch;
+
+          const aQuota = a.remainingFraction ?? 1.0;
+          const bQuota = b.remainingFraction ?? 1.0;
+          return bQuota - aQuota;
+        });
+
+        const alternateModel = candidateModels[0];
 
         if (alternateModel) {
           this.log(`Pid ${proc.pid}: Found alternate model ${alternateModel.label} (${alternateModel.model}) with remaining credits.`);
@@ -393,7 +411,11 @@ export class AutoResumer {
   }
 }
 
-export function formatResetTime(resetTimeStr: string): string {
+export function formatResetTime(resetTimeStr: string, remainingFraction?: number): string {
+  if (remainingFraction !== undefined && remainingFraction >= 0.999) {
+    return 'Full Quota';
+  }
+
   try {
     const resetDate = new Date(resetTimeStr);
     if (isNaN(resetDate.getTime())) {
@@ -435,11 +457,34 @@ export function formatResetTime(resetTimeStr: string): string {
   }
 }
 
-function getShortModelLabel(label: string): string {
-  if (label.includes('Sonnet')) return 'Sonnet';
-  if (label.includes('Opus')) return 'Opus';
-  if (label.includes('Flash')) return 'Flash';
-  if (label.includes('Pro')) return 'Pro';
-  if (label.includes('GPT-OSS')) return 'GPT-OSS';
-  return label.split(' ').slice(0, 2).join(' ');
+export function getShortModelLabel(label: string): string {
+  if (!label) return 'Unknown';
+
+  const versionMatch = label.match(/(\d+\.\d+)/);
+  const version = versionMatch ? versionMatch[1] : '';
+
+  let tier = '';
+  if (label.includes('(High)')) tier = '-H';
+  else if (label.includes('(Medium)')) tier = '-M';
+  else if (label.includes('(Low)')) tier = '-L';
+
+  if (label.includes('Flash')) {
+    return version ? `${version} Flash${tier}` : `Flash${tier}`;
+  }
+  if (label.includes('Pro')) {
+    return version ? `${version} Pro${tier}` : `Pro${tier}`;
+  }
+  if (label.includes('Sonnet')) {
+    return version ? `Sonnet ${version}` : 'Sonnet';
+  }
+  if (label.includes('Opus')) {
+    return version ? `Opus ${version}` : 'Opus';
+  }
+  if (label.includes('GPT-OSS')) {
+    return 'GPT-OSS';
+  }
+
+  const cleaned = label.replace(/^(Gemini|Claude)\s+/i, '').trim();
+  return cleaned || label.split(' ').slice(0, 2).join(' ');
 }
+
