@@ -40,14 +40,13 @@ install-ide: package
 
 sync: build
 	@echo "=== 1. Preparing publish sub-repo ==="
-	@mkdir -p publish
 	@if [ ! -d "publish/.git" ]; then \
-		echo "Initializing Git repository in publish/..." ; \
-		cd publish && git init && git checkout -b main; \
-	fi
-	@if ! git -C publish remote | grep -q origin; then \
-		echo "Setting remote origin to GitHub..." ; \
-		git -C publish remote add origin https://github.com/iafilius/antigravity-credit-resumer.git; \
+		echo "Cloning GitHub sub-repo into publish/..." ; \
+		rm -rf publish ; \
+		git clone https://github.com/iafilius/antigravity-credit-resumer.git publish ; \
+	else \
+		echo "Ensuring remote origin is set to GitHub..." ; \
+		git -C publish remote set-url origin https://github.com/iafilius/antigravity-credit-resumer.git ; \
 	fi
 	@echo "=== 2. Syncing clean production files ==="
 	@cp .gitignore package.json package-lock.json tsconfig.json esbuild.js README.md LICENSE Makefile publish/
@@ -62,7 +61,7 @@ push-github: sync
 	@echo "=== 4. Committing and Pushing to GitHub ==="
 	@cd publish && \
 		git add . && \
-		(git diff-index --quiet HEAD || git commit -m "Public release update $$(date +'%Y-%m-%d %H:%M')") && \
+		(git diff-index --quiet HEAD 2>/dev/null || git commit -m "Public release update $$(date +'%Y-%m-%d %H:%M')") && \
 		git push -u origin main
 	@echo "Successfully published to GitHub!"
 
