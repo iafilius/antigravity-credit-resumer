@@ -79,6 +79,7 @@ export class AutoResumer {
     const remainingFraction = hasRemainingFraction ? currentModelQuota!.remainingFraction! : 1.0;
 
     const isExhausted = remainingFraction <= 0.001; // Quota <= 0%
+    const isLowQuota = remainingFraction <= 0.05; // Quota <= 5%
 
     // Update Status Bar Item
     if (this.statusBarItem) {
@@ -148,16 +149,16 @@ export class AutoResumer {
       state.lastRemainingFraction = remainingFraction;
     }
 
-    if (isExhausted) {
+    if (isLowQuota) {
       state.modelExhausted = true;
 
       if (!state.waitingForRefill) {
-        this.log(`Pid ${proc.pid}: Model ${currentModelId} ran out of credits!`);
+        this.log(`Pid ${proc.pid}: Model ${currentModelId} reached low quota (${(remainingFraction * 100).toFixed(1)}%)! Flagged waiting for refill.`);
         state.waitingForRefill = true;
         const now = new Date().toLocaleString();
         appendToLogFile(
           'resumer-history.md',
-          `| \`${proc.pid}\` | \`${now}\` | **Quota Exhausted** | Model \`${currentModelId}\` reached 0% | Suspended |\n`
+          `| \`${proc.pid}\` | \`${now}\` | **Quota Exhausted** | Model \`${currentModelId}\` reached ${(remainingFraction * 100).toFixed(1)}% | Suspended |\n`
         );
       }
 
@@ -213,8 +214,9 @@ export class AutoResumer {
         }
       }
     } else {
-      // Current model has credits
-      if (state.waitingForRefill) {
+      // Current model has available credits
+      const isRefilled = (state.waitingForRefill || (state.lastRemainingFraction !== undefined && state.lastRemainingFraction <= 0.05)) && remainingFraction >= 0.50;
+      if (isRefilled) {
         this.log(`Pid ${proc.pid}: Model ${currentModelId} has been refilled (remainingFraction=${remainingFraction.toFixed(4)})!`);
         const now = new Date().toLocaleString();
         appendToLogFile(
@@ -231,9 +233,12 @@ export class AutoResumer {
   private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string) {
     this.activityChannel.appendLine(`[AutoResumer] Attempting to resume active cascade for process PID ${proc.pid} using model ${modelId}...`);
 
-    const trajectories = await this.getAllTrajectories(proc);
-    if (!trajectories || Object.keys(trajectories).length === 0) {
-      this.log(`Pid ${proc.pid}: No trajectories found to resume.`);
+    const rawTrajectories = await this.getAllTrajectories(proc);
+    const map = extractTrajectoryMap(rawTrajectories);
+    const allIds = Object.keys(map);
+
+    if (allIds.length === 0) {
+      this.log(`Pid ${proc.pid}: No trajectories found to resume (raw keys=${Object.keys(rawTrajectories || {}).join(',')}).`);
       const now = new Date().toLocaleString();
       appendToLogFile(
         'resumer-history.md',
@@ -242,25 +247,35 @@ export class AutoResumer {
       return;
     }
 
+    // Filter trajectories by workspace
+    const candidateEntries = allIds
+      .map(id => ({ id, traj: map[id] }))
+      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
+
+    this.log(`Pid ${proc.pid}: Found ${allIds.length} total trajectories, ${candidateEntries.length} matched workspace (${proc.workspaceId || 'global'}).`);
+
+    if (candidateEntries.length === 0) {
+      this.log(`Pid ${proc.pid}: No workspace-matched trajectories found; falling back to all available trajectories.`);
+      candidateEntries.push(...allIds.map(id => ({ id, traj: map[id] })));
+    }
+
     // Find the most recently modified trajectory
     let activeTrajectoryId: string | null = null;
     let maxTime = 0;
 
-    for (const id of Object.keys(trajectories)) {
-      const traj = trajectories[id];
-      const modTimeStr = traj.lastModifiedTime || traj.lastUserInputTime || '';
+    for (const { id, traj } of candidateEntries) {
+      const modTimeStr = traj?.lastModifiedTime || traj?.lastUserInputTime || traj?.trajectoryMetadata?.createdAt || '';
       if (modTimeStr) {
         const time = new Date(modTimeStr).getTime();
         if (time > maxTime) {
           maxTime = time;
-          activeTrajectoryId = traj.trajectoryId || id;
+          activeTrajectoryId = traj?.trajectoryId || id;
         }
       }
     }
 
     if (!activeTrajectoryId) {
-      // Fallback to first key
-      activeTrajectoryId = Object.keys(trajectories)[0];
+      activeTrajectoryId = candidateEntries[0].traj?.trajectoryId || candidateEntries[0].id;
     }
 
     if (activeTrajectoryId) {
@@ -487,4 +502,43 @@ export function getShortModelLabel(label: string): string {
   const cleaned = label.replace(/^(Gemini|Claude)\s+/i, '').trim();
   return cleaned || label.split(' ').slice(0, 2).join(' ');
 }
+
+export function extractTrajectoryMap(rawResponse: any): Record<string, any> {
+  if (!rawResponse) return {};
+  if (rawResponse.trajectorySummaries && typeof rawResponse.trajectorySummaries === 'object') {
+    return rawResponse.trajectorySummaries;
+  }
+  return typeof rawResponse === 'object' ? rawResponse : {};
+}
+
+export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any): boolean {
+  if (!procWorkspaceId) return true; // Global process or no workspace context
+
+  const cleanWorkspaceString = (str: string): string => {
+    let s = str.replace(/^file:\/\//, '');
+    if (s.startsWith('file_')) {
+      s = '/' + s.substring(5).replace(/_/g, '/');
+    }
+    return s.toLowerCase();
+  };
+
+  const procPath = cleanWorkspaceString(procWorkspaceId);
+
+  const workspaceObjects = traj?.workspaces || [];
+  const metadataUris = traj?.trajectoryMetadata?.workspaceUris || [];
+
+  const uris: string[] = [
+    ...workspaceObjects.map((w: any) => w.workspaceFolderAbsoluteUri || ''),
+    ...metadataUris,
+  ].filter(Boolean);
+
+  if (uris.length === 0) return true; // No workspace restrictions on trajectory
+
+  return uris.some((u) => {
+    const cleanUri = cleanWorkspaceString(u);
+    return cleanUri.includes(procPath) || procPath.includes(cleanUri);
+  });
+}
+
+
 
