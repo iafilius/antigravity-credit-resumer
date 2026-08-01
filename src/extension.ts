@@ -16,17 +16,19 @@ const cachedProcesses = new Map<number, any>();
 let tickCount = 0;
 
 export function activate(context: vscode.ExtensionContext) {
+  const version = context.extension?.packageJSON?.version || '0.3.0';
+
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');
   debugChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer (Debug)');
 
-  activityChannel.appendLine('Antigravity Credit Auto-Resumer Activity Log initialized.');
-  debugChannel.appendLine('Antigravity Credit Auto-Resumer Debug Log initialized.');
+  activityChannel.appendLine(`Antigravity Credit Auto-Resumer v${version} Activity Log initialized.`);
+  debugChannel.appendLine(`Antigravity Credit Auto-Resumer v${version} Debug Log initialized.`);
 
   // Create Status Bar Item
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.text = '$(credit-card) AGY: Init';
-  statusBarItem.tooltip = 'Antigravity Credit Auto-Resumer is initializing';
+  statusBarItem.tooltip = `Antigravity Credit Auto-Resumer v${version} is initializing`;
   statusBarItem.command = 'antigravityCreditResumer.showActivity';
 
   // Register command to show activity logs
@@ -50,7 +52,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
   context.subscriptions.push(statusBarItem);
 
-  autoResumer = new AutoResumer(activityChannel, debugChannel, statusBarItem);
+  autoResumer = new AutoResumer(activityChannel, debugChannel, statusBarItem, version);
 
   // Setup file logging OutputChannel, rotate old debug logs, and initialize the report
   setFileLoggerOutputChannel(activityChannel);
@@ -59,7 +61,7 @@ export function activate(context: vscode.ExtensionContext) {
     const now = new Date().toLocaleString();
     const intervalSeconds = vscode.workspace.getConfiguration('antigravityCreditResumer').get<number>('checkInterval', 60);
     const mode = vscode.workspace.getConfiguration('antigravityCreditResumer').get<string>('modelSelectionMode', 'stick');
-    const logMsg = `| \`${process.pid}\` | \`${now}\` | **Resumer Init** | Monitoring interval: ${intervalSeconds}s, mode: \`${mode}\` | Ready |\n`;
+    const logMsg = `| \`${process.pid}\` | \`${now}\` | **Resumer Init (v${version})** | Monitoring interval: ${intervalSeconds}s, mode: \`${mode}\` | Ready |\n`;
     appendToLogFile('resumer-history.md', logMsg);
   });
 

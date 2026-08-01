@@ -11,18 +11,21 @@ interface ResumerState {
   lastPromptCredits?: number;
   lastFlowCredits?: number;
   lastRemainingFraction?: number;
+  lastModelQuotas?: Map<string, number>;
 }
 
 export class AutoResumer {
   private activityChannel: vscode.OutputChannel;
   private debugChannel: vscode.OutputChannel;
   private statusBarItem?: vscode.StatusBarItem;
+  private extensionVersion: string;
   private states = new Map<number, ResumerState>();
 
-  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem) {
+  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.3.0') {
     this.activityChannel = activityChannel;
     this.debugChannel = debugChannel;
     this.statusBarItem = statusBarItem;
+    this.extensionVersion = extensionVersion;
   }
 
   public log(msg: string) {
@@ -62,8 +65,8 @@ export class AutoResumer {
       state.lastFlowCredits = credits.availableFlowCredits;
     }
 
-    // 1. Identify currently active/selected model
-    const currentModelId = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
+    // 1. Identify currently active/selected model dynamically
+    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel);
     if (!currentModelId) {
       return;
     }
@@ -72,6 +75,15 @@ export class AutoResumer {
       this.activityChannel.appendLine(`[AutoResumer] Pid ${proc.pid}: Selected model changed to ${currentModelId}`);
       state.lastSelectedModel = currentModelId;
     }
+
+    // Record current model quotas for delta tracking on subsequent ticks
+    const currentQuotas = new Map<string, number>();
+    for (const m of credits.models) {
+      if (m.model && m.remainingFraction !== undefined) {
+        currentQuotas.set(m.model, m.remainingFraction);
+      }
+    }
+    state.lastModelQuotas = currentQuotas;
 
     // Find current model's quota info
     const currentModelQuota = credits.models.find(m => m.model === currentModelId);
@@ -108,7 +120,7 @@ export class AutoResumer {
         }).join('\n');
 
         const tooltip = new vscode.MarkdownString(
-          `**Antigravity Credit Auto-Resumer**\n\n` +
+          `**Antigravity Credit Auto-Resumer (v${this.extensionVersion})**\n\n` +
           `### 👤 Active Model Status\n` +
           `• **Model**: ${modelLabel}\n` +
           `• **Quota Remaining**: ${quotaPercentage}\n` +
@@ -121,7 +133,7 @@ export class AutoResumer {
           `### 📊 All Model Quotas (Rate Limits)\n` +
           `${modelQuotasLines}\n\n` +
           `---\n\n` +
-          `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate)`
+          `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate) | *v${this.extensionVersion}*`
         );
         tooltip.isTrusted = true;
         this.statusBarItem.tooltip = tooltip;
@@ -539,6 +551,72 @@ export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any)
     return cleanUri.includes(procPath) || procPath.includes(cleanUri);
   });
 }
+
+export function resolveActiveModelId(
+  credits: UserCreditsStatus,
+  lastModelQuotas?: Map<string, number>,
+  lastActiveModelId?: string,
+  rawTrajectories?: any
+): string {
+  // 1. Trajectory metadata inspection
+  if (rawTrajectories) {
+    const trajectoryMap = extractTrajectoryMap(rawTrajectories);
+    const ids = Object.keys(trajectoryMap);
+    if (ids.length > 0) {
+      let maxTime = 0;
+      let latestTrajModel = '';
+      for (const id of ids) {
+        const traj = trajectoryMap[id];
+        const timeStr = traj?.lastModifiedTime || traj?.lastUserInputTime || traj?.trajectoryMetadata?.createdAt || '';
+        const t = timeStr ? new Date(timeStr).getTime() : 0;
+        if (t >= maxTime) {
+          const modelId = traj?.requestedModel?.modelOrAlias?.model || traj?.modelConfig?.modelOrAlias?.model || traj?.model;
+          if (modelId) {
+            maxTime = t;
+            latestTrajModel = modelId;
+          }
+        }
+      }
+      if (latestTrajModel) {
+        return latestTrajModel;
+      }
+    }
+  }
+
+  // 2. Quota Delta Tracking: Find model whose remainingFraction decreased since last tick
+  if (lastModelQuotas) {
+    for (const m of credits.models) {
+      if (m.model && m.remainingFraction !== undefined) {
+        const prev = lastModelQuotas.get(m.model);
+        if (prev !== undefined && m.remainingFraction < prev - 0.0001) {
+          return m.model;
+        }
+      }
+    }
+  }
+
+  // 3. Last Active Model Persistence: If previous model was below 100% quota, preserve it
+  if (lastActiveModelId) {
+    const prevQuota = credits.models.find(m => m.model === lastActiveModelId);
+    if (prevQuota && prevQuota.remainingFraction !== undefined && prevQuota.remainingFraction < 0.999) {
+      return lastActiveModelId;
+    }
+  }
+
+  // 4. In-Use Model Fallback: If static default override is 100%, but another model is < 100% (e.g. Claude Sonnet at 53%), select active used model
+  const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
+  const staticQuota = credits.models.find(m => m.model === staticDefault);
+  if (staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction >= 0.999) {
+    const activeUsedModel = credits.models.find(m => m.remainingFraction !== undefined && m.remainingFraction < 0.999);
+    if (activeUsedModel) {
+      return activeUsedModel.model;
+    }
+  }
+
+  // 5. Default Fallback
+  return staticDefault || (credits.models.length > 0 ? credits.models[0].model : '');
+}
+
 
 
 
