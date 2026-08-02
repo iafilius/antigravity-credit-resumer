@@ -89,9 +89,36 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  // Listen for user interaction events (window focus gain, active text editor change) for swift tick evaluation
+  context.subscriptions.push(
+    vscode.window.onDidChangeWindowState((e) => {
+      if (e.focused) {
+        scheduleDebouncedTick();
+      }
+    }),
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      scheduleDebouncedTick();
+    })
+  );
+}
+
+let eventDebounceTimer: NodeJS.Timeout | undefined;
+function scheduleDebouncedTick() {
+  if (eventDebounceTimer) {
+    clearTimeout(eventDebounceTimer);
+  }
+  eventDebounceTimer = setTimeout(() => {
+    eventDebounceTimer = undefined;
+    pollIntervalTick();
+  }, 500);
 }
 
 export function deactivate() {
+  if (eventDebounceTimer) {
+    clearTimeout(eventDebounceTimer);
+    eventDebounceTimer = undefined;
+  }
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = undefined;

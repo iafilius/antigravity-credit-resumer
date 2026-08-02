@@ -11,9 +11,11 @@ Depending on your choice of settings, it either **waits for credit quotas to ref
 1.  **Process Discovery**: Automatically scans local processes to find running instances of the Antigravity Language Server and extracts their CSRF tokens.
 2.  **Port Mapping**: Discovers the dynamic local HTTPS/gRPC ports that the target processes are listening on.
 3.  **Credit Status Monitoring**: Queries the local Connect RPC `/GetUserStatus` endpoint to monitor prompt/flow credits and individual model quotas.
-4.  **Auto-Resume Cascade**: Depending on your chosen settings (`stick` mode), waits for model credits to refresh and then automatically sends `"continue"` (or your custom prompt) to resume active conversations/cascades.
-5.  **Smart Model Switching**: In `auto` mode, automatically switches to another model with available credits when the current model is exhausted, and then resumes the active cascade immediately.
-6.  **Clean Lifecycle**: Runs entirely in-memory and cleanly terminates all background timers and Output Channels upon extension unload, leaving no trace on disk.
+4.  **Model Detection**: Automatically tracks which AI model is currently active in the IDE using a multi-signal heuristic — combining trajectory metadata, quota consumption deltas, and configuration data. Updates within one polling tick after you send a message on a newly selected model.
+5.  **Auto-Resume Cascade**: Depending on your chosen settings (`stick` mode), waits for model credits to refresh and then automatically sends `"continue"` (or your custom prompt) to resume active conversations/cascades.
+6.  **Smart Model Switching**: In `auto` mode, automatically switches to another model with available credits when the current model is exhausted, and then resumes the active cascade immediately.
+7.  **Persistent Logging**: Mirrors all activity to `.logs/resumer-debug.log` and maintains an append-only resumption history at `.logs/resumer-history.md` inside the active workspace.
+8.  **Clean Lifecycle**: Runs entirely in-memory and cleanly terminates all background timers and Output Channels upon extension unload, leaving no trace on disk beyond the `.logs/` directory.
 
 ---
 
@@ -36,6 +38,8 @@ You can configure these settings in the IDE Settings editor:
     *   Show credit status indicator in the bottom status bar (Default: `true`).
 *   **`antigravityCreditResumer.showNotifications`** (`boolean`):
     *   Show toast notification actions when a cascade is auto-continued or model is switched (Default: `true`).
+*   **`antigravityCreditResumer.persistentLogging`** (`boolean`):
+    *   Mirror all logs to `.logs/resumer-debug.log` and maintain a resumption history at `.logs/resumer-history.md` in the active workspace (Default: `true`). Log files are rotated at 5 MB.
 
 ---
 
@@ -48,7 +52,7 @@ Run the following command in the extension directory to install dependencies, co
 ```bash
 make package
 ```
-This generates a package file named `antigravity-credit-resumer-0.1.0.vsix` in your root directory.
+This generates a package file named `antigravity-credit-resumer-0.4.0.vsix` in your root directory.
 
 ### Step 2: Install in the IDE
 You can install the packaged extension directly using the Makefile:
@@ -58,7 +62,7 @@ make install-ide
 Alternatively, to install it manually through the UI:
 1.  Open the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows/Linux).
 2.  Search for and run: **`Extensions: Install from VSIX...`**
-3.  Choose the generated `antigravity-credit-resumer-0.1.0.vsix` file.
+3.  Choose the generated `antigravity-credit-resumer-0.4.0.vsix` file.
 4.  Reload the window to activate.
 
 ---
@@ -82,3 +86,11 @@ You can publish the extension directly using the Makefile:
 make publish TOKEN=<YOUR_OPEN_VSX_TOKEN>
 ```
 This automatically packages the extension and uploads the resulting `.vsix` file to the Open VSX registry.
+
+---
+
+## 5. Documentation
+
+*   **[docs/architecture.md](docs/architecture.md)** — Full technical overview: process discovery, credit monitoring, trajectory detection, automated continuation, and sleep/wake behavior.
+*   **[docs/model-detection.md](docs/model-detection.md)** — Deep dive into model detection: the 6-step `resolveActiveModelId()` heuristic, data sources, workspace scoping, known limitations, and test coverage.
+*   **[CHANGELOG.md](CHANGELOG.md)** — Version history.

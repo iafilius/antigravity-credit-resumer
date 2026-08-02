@@ -18,3 +18,7 @@ Thumbs.db
 # Subfolder publishing repository
 publish/
 
+# VS Code test runner
+.vscode-test/
+
+

@@ -66,7 +66,8 @@ export class AutoResumer {
     }
 
     // 1. Identify currently active/selected model dynamically
-    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel);
+    const rawTrajectories = await this.getAllTrajectories(proc);
+    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId);
     if (!currentModelId) {
       return;
     }
@@ -556,9 +557,10 @@ export function resolveActiveModelId(
   credits: UserCreditsStatus,
   lastModelQuotas?: Map<string, number>,
   lastActiveModelId?: string,
-  rawTrajectories?: any
+  rawTrajectories?: any,
+  workspaceId?: string
 ): string {
-  // 1. Trajectory metadata inspection
+  // 1. Workspace-Scoped Trajectory Metadata Inspection
   if (rawTrajectories) {
     const trajectoryMap = extractTrajectoryMap(rawTrajectories);
     const ids = Object.keys(trajectoryMap);
@@ -567,6 +569,9 @@ export function resolveActiveModelId(
       let latestTrajModel = '';
       for (const id of ids) {
         const traj = trajectoryMap[id];
+        if (workspaceId && !matchesWorkspace(workspaceId, traj)) {
+          continue;
+        }
         const timeStr = traj?.lastModifiedTime || traj?.lastUserInputTime || traj?.trajectoryMetadata?.createdAt || '';
         const t = timeStr ? new Date(timeStr).getTime() : 0;
         if (t >= maxTime) {
@@ -595,7 +600,21 @@ export function resolveActiveModelId(
     }
   }
 
-  // 3. Last Active Model Persistence: If previous model was below 100% quota, preserve it
+  // 3. Explicit UI Model Switch / Zero-Quota Selected Model Override
+  const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
+  const staticQuota = credits.models.find(m => m.model === staticDefault);
+
+  // Explicit UI Model Switch: defaultOverrideModelConfig changed from lastActiveModelId
+  if (staticDefault && staticQuota && lastActiveModelId && staticDefault !== lastActiveModelId) {
+    return staticDefault;
+  }
+
+  // Zero-Quota Selected Model Override: If default override model is exhausted (<= 0.001), prefer it over cached model
+  if (staticDefault && staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction <= 0.001) {
+    return staticDefault;
+  }
+
+  // 4. Last Active Model Persistence: If previous model was below 100% quota and override hasn't changed, preserve it
   if (lastActiveModelId) {
     const prevQuota = credits.models.find(m => m.model === lastActiveModelId);
     if (prevQuota && prevQuota.remainingFraction !== undefined && prevQuota.remainingFraction < 0.999) {
@@ -603,17 +622,15 @@ export function resolveActiveModelId(
     }
   }
 
-  // 4. In-Use Model Fallback: If static default override is 100%, but another model is < 100% (e.g. Claude Sonnet at 53%), select active used model
-  const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
-  const staticQuota = credits.models.find(m => m.model === staticDefault);
-  if (staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction >= 0.999) {
+  // 5. In-Use Model Fallback: If static default override is 100%, but another model is < 100% (e.g. Claude Sonnet at 53%), select active used model ONLY when no lastActiveModelId was set
+  if (!lastActiveModelId && staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction >= 0.999) {
     const activeUsedModel = credits.models.find(m => m.remainingFraction !== undefined && m.remainingFraction < 0.999);
     if (activeUsedModel) {
       return activeUsedModel.model;
     }
   }
 
-  // 5. Default Fallback
+  // 6. Default Fallback
   return staticDefault || (credits.models.length > 0 ? credits.models[0].model : '');
 }
 
