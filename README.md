@@ -52,7 +52,7 @@ Run the following command in the extension directory to install dependencies, co
 ```bash
 make package
 ```
-This generates a package file named `antigravity-credit-resumer-0.4.0.vsix` in your root directory.
+This generates a package file named `antigravity-credit-resumer-0.5.0.vsix` in your root directory.
 
 ### Step 2: Install in the IDE
 You can install the packaged extension directly using the Makefile:
@@ -62,7 +62,7 @@ make install-ide
 Alternatively, to install it manually through the UI:
 1.  Open the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows/Linux).
 2.  Search for and run: **`Extensions: Install from VSIX...`**
-3.  Choose the generated `antigravity-credit-resumer-0.4.0.vsix` file.
+3.  Choose the generated `antigravity-credit-resumer-0.5.0.vsix` file.
 4.  Reload the window to activate.
 
 ---

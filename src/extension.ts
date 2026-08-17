@@ -16,7 +16,7 @@ const cachedProcesses = new Map<number, any>();
 let tickCount = 0;
 
 export function activate(context: vscode.ExtensionContext) {
-  const version = context.extension?.packageJSON?.version || '0.3.0';
+  const version = context.extension?.packageJSON?.version || '0.5.0';
 
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');

@@ -21,7 +21,7 @@ export class AutoResumer {
   private extensionVersion: string;
   private states = new Map<number, ResumerState>();
 
-  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.3.0') {
+  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.5.0') {
     this.activityChannel = activityChannel;
     this.debugChannel = debugChannel;
     this.statusBarItem = statusBarItem;
@@ -219,16 +219,19 @@ export class AutoResumer {
               }
             });
           }
-          await this.resumeActiveCascade(proc, alternateModel.model, resumePrompt);
-          state.waitingForRefill = false;
-          state.modelExhausted = false;
+          const success = await this.resumeActiveCascade(proc, alternateModel.model, resumePrompt);
+          if (success) {
+            state.waitingForRefill = false;
+            state.modelExhausted = false;
+          }
         } else {
           this.log(`Pid ${proc.pid}: No alternate models with available credits found. Waiting for refill...`);
         }
       }
     } else {
       // Current model has available credits
-      const isRefilled = (state.waitingForRefill || (state.lastRemainingFraction !== undefined && state.lastRemainingFraction <= 0.05)) && remainingFraction >= 0.50;
+      const resetTimePassed = !currentModelQuota?.resetTime || isNaN(new Date(currentModelQuota.resetTime).getTime()) || new Date() >= new Date(currentModelQuota.resetTime);
+      const isRefilled = (state.waitingForRefill || (state.lastRemainingFraction !== undefined && state.lastRemainingFraction <= 0.05)) && remainingFraction >= 0.50 && resetTimePassed;
       if (isRefilled) {
         this.log(`Pid ${proc.pid}: Model ${currentModelId} has been refilled (remainingFraction=${remainingFraction.toFixed(4)})!`);
         const now = new Date().toLocaleString();
@@ -236,14 +239,19 @@ export class AutoResumer {
           'resumer-history.md',
           `| \`${proc.pid}\` | \`${now}\` | **Quota Refilled** | Model \`${currentModelId}\` refilled to ${(remainingFraction * 100).toFixed(1)}% | Refilled |\n`
         );
-        await this.resumeActiveCascade(proc, currentModelId, resumePrompt);
-        state.waitingForRefill = false;
+        const success = await this.resumeActiveCascade(proc, currentModelId, resumePrompt);
+        if (success) {
+          state.waitingForRefill = false;
+        } else {
+          this.log(`Pid ${proc.pid}: Resume attempt failed for model ${currentModelId}. Retaining waitingForRefill state.`);
+          state.waitingForRefill = true;
+        }
       }
       state.modelExhausted = false;
     }
   }
 
-  private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string) {
+  private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string): Promise<boolean> {
     this.activityChannel.appendLine(`[AutoResumer] Attempting to resume active cascade for process PID ${proc.pid} using model ${modelId}...`);
 
     const rawTrajectories = await this.getAllTrajectories(proc);
@@ -257,7 +265,7 @@ export class AutoResumer {
         'resumer-history.md',
         `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | No active trajectories found to resume | Idle |\n`
       );
-      return;
+      return false;
     }
 
     // Filter trajectories by workspace
@@ -314,14 +322,17 @@ export class AutoResumer {
             }
           });
         }
+        return true;
       } else {
         this.activityChannel.appendLine(`[AutoResumer] Failed to resume cascade ${activeTrajectoryId}.`);
         appendToLogFile(
           'resumer-history.md',
           `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | Failed to resume trajectory \`${activeTrajectoryId.substring(0, 8)}\` via model \`${modelId}\` | Failure |\n`
         );
+        return false;
       }
     }
+    return false;
   }
 
   private getAllTrajectories(proc: DetectedProcess): Promise<any | null> {
@@ -439,50 +450,61 @@ export class AutoResumer {
   }
 }
 
-export function formatResetTime(resetTimeStr: string, remainingFraction?: number): string {
+export function formatResetTime(resetTimeStr?: string, remainingFraction?: number): string {
+  if (resetTimeStr) {
+    try {
+      const resetDate = new Date(resetTimeStr);
+      if (!isNaN(resetDate.getTime())) {
+        const now = new Date();
+        const diffMs = resetDate.getTime() - now.getTime();
+        if (diffMs > 0) {
+          const diffMins = Math.floor(diffMs / 60000);
+          const diffHours = Math.floor(diffMins / 60);
+          const diffDays = Math.floor(diffHours / 24);
+
+          let relativeStr = '';
+          if (diffDays > 0) {
+            relativeStr = `${diffDays}d ${diffHours % 24}h`;
+          } else if (diffHours > 0) {
+            relativeStr = `${diffHours}h ${diffMins % 60}m`;
+          } else {
+            relativeStr = `${diffMins}m`;
+          }
+
+          const isToday = resetDate.toDateString() === now.toDateString();
+          const timeStr = resetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+          let absoluteStr = '';
+          if (isToday) {
+            absoluteStr = `Today at ${timeStr}`;
+          } else {
+            const month = String(resetDate.getMonth() + 1).padStart(2, '0');
+            const day = String(resetDate.getDate()).padStart(2, '0');
+            absoluteStr = `${month}/${day} at ${timeStr}`;
+          }
+
+          return `in ${relativeStr} (${absoluteStr})`;
+        }
+      }
+    } catch (e) {}
+  }
+
   if (remainingFraction !== undefined && remainingFraction >= 0.999) {
     return 'Full Quota';
   }
 
-  try {
-    const resetDate = new Date(resetTimeStr);
-    if (isNaN(resetDate.getTime())) {
-      return 'N/A';
-    }
-    const now = new Date();
-    const diffMs = resetDate.getTime() - now.getTime();
-    if (diffMs <= 0) {
-      return 'Pending Refill';
-    }
-
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMins / 60);
-    const diffDays = Math.floor(diffHours / 24);
-
-    let relativeStr = '';
-    if (diffDays > 0) {
-      relativeStr = `${diffDays}d ${diffHours % 24}h`;
-    } else if (diffHours > 0) {
-      relativeStr = `${diffHours}h ${diffMins % 60}m`;
-    } else {
-      relativeStr = `${diffMins}m`;
-    }
-
-    const isToday = resetDate.toDateString() === now.toDateString();
-    const timeStr = resetDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-    let absoluteStr = '';
-    if (isToday) {
-      absoluteStr = `Today at ${timeStr}`;
-    } else {
-      const month = String(resetDate.getMonth() + 1).padStart(2, '0');
-      const day = String(resetDate.getDate()).padStart(2, '0');
-      absoluteStr = `${month}/${day} at ${timeStr}`;
-    }
-
-    return `in ${relativeStr} (${absoluteStr})`;
-  } catch (e) {
-    return 'N/A';
+  if (resetTimeStr) {
+    try {
+      const resetDate = new Date(resetTimeStr);
+      if (!isNaN(resetDate.getTime())) {
+        const now = new Date();
+        if (resetDate.getTime() - now.getTime() <= 0) {
+          return 'Pending Refill';
+        }
+      }
+    } catch (e) {}
   }
+
+  return 'N/A';
 }
 
 export function getShortModelLabel(label: string): string {

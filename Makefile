@@ -49,7 +49,7 @@ sync: build
 		git -C publish remote set-url origin https://github.com/iafilius/antigravity-credit-resumer.git ; \
 	fi
 	@echo "=== 2. Syncing clean production files ==="
-	@cp .gitignore package.json package-lock.json tsconfig.json esbuild.js README.md LICENSE Makefile publish/
+	@cp .gitignore package.json package-lock.json tsconfig.json esbuild.js README.md LICENSE CHANGELOG.md Makefile publish/
 	@rsync -av --delete --exclude='*.ts.bak' src/ publish/src/
 	@rsync -av --delete docs/ publish/docs/
 
