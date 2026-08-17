@@ -43,7 +43,32 @@ You can configure these settings in the IDE Settings editor:
 
 ---
 
-## 3. Local Installation & Testing
+## 3. Installation via Homebrew (Recommended)
+
+You can install and keep the extension updated automatically via Homebrew:
+
+```bash
+# Add dedicated tap
+brew tap iafilius/tap
+
+# Install extension (automatically provisions into Antigravity IDE and VS Code)
+brew install antigravity-credit-resumer
+
+# Upgrade to latest version anytime
+brew upgrade antigravity-credit-resumer
+```
+
+The formula installs the `.vsix` into Homebrew's shared repository and triggers immediate auto-installation into Antigravity IDE. You can also re-trigger the IDE installation or inspect the package path via the CLI helper:
+
+```bash
+antigravity-credit-resumer install   # Install / re-provision extension into IDE
+antigravity-credit-resumer path      # Print path to cached .vsix package
+antigravity-credit-resumer version   # Print version
+```
+
+---
+
+## 4. Local Installation & Testing
 
 To build and run the extension locally:
 
@@ -67,7 +92,7 @@ Alternatively, to install it manually through the UI:
 
 ---
 
-## 4. Registering & Publishing on Open VSX
+## 5. Registering & Publishing on Open VSX
 
 Open VSX is an open-source alternative registry to the Microsoft VS Code Marketplace.
 
@@ -89,7 +114,7 @@ This automatically packages the extension and uploads the resulting `.vsix` file
 
 ---
 
-## 5. Documentation
+## 6. Documentation
 
 *   **[docs/architecture.md](docs/architecture.md)** — Full technical overview: process discovery, credit monitoring, trajectory detection, automated continuation, and sleep/wake behavior.
 *   **[docs/model-detection.md](docs/model-detection.md)** — Deep dive into model detection: the 6-step `resolveActiveModelId()` heuristic, data sources, workspace scoping, known limitations, and test coverage.

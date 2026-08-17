@@ -1,4 +1,4 @@
-.PHONY: install build package publish clean validate install-ide help sync push-github
+.PHONY: install build package publish clean validate install-ide help sync push-github release-brew
 
 # Default target
 all: build
@@ -13,6 +13,7 @@ help:
 	@echo "  install-ide  - Install packaged extension into Antigravity IDE"
 	@echo "  sync         - Sync production source code to the local publish folder and run sanity build"
 	@echo "  push-github  - Sync, stage, commit, and push public sub-repo to GitHub"
+	@echo "  release-brew - Package VSIX, compute sha256, and update Homebrew tap formula"
 	@echo "  clean        - Clean build artifacts (dist, out, node_modules, vsix, publish)"
 
 install:
@@ -62,8 +63,23 @@ push-github: sync
 	@cd publish && \
 		git add . && \
 		(git diff-index --quiet HEAD 2>/dev/null || git commit -m "Public release update $$(date +'%Y-%m-%d %H:%M')") && \
-		git push -u origin main
+		env -u GITHUB_TOKEN git push -u origin main
 	@echo "Successfully published to GitHub!"
+
+release-brew: package
+	@echo "=== Updating Homebrew Formula & Tap Repository ==="
+	@VERSION=$$(node -p "require('./package.json').version"); \
+	VSIX_FILE="antigravity-credit-resumer-$$VERSION.vsix"; \
+	SHA=$$(shasum -a 256 "$$VSIX_FILE" | awk '{print $$1}'); \
+	TAP_DIR="/Users/arjan/personal/brew_tab"; \
+	if [ -d "$$TAP_DIR" ]; then \
+		sed -i '' "s|url \"https://github.com/iafilius/antigravity-credit-resumer/releases/download/.*\"|url \"https://github.com/iafilius/antigravity-credit-resumer/releases/download/v$$VERSION/antigravity-credit-resumer-$$VERSION.vsix\"|g" "$$TAP_DIR/Formula/antigravity-credit-resumer.rb"; \
+		sed -i '' "s|sha256 \".*\"|sha256 \"$$SHA\"|g" "$$TAP_DIR/Formula/antigravity-credit-resumer.rb"; \
+		git -C "$$TAP_DIR" add Formula/antigravity-credit-resumer.rb; \
+		(git -C "$$TAP_DIR" diff --cached --quiet || git -C "$$TAP_DIR" commit -m "chore(brew): update antigravity-credit-resumer formula to v$$VERSION"); \
+		env -u GITHUB_TOKEN git -C "$$TAP_DIR" push origin main || true; \
+		echo "Homebrew tap updated to v$$VERSION ($$SHA)!"; \
+	fi
 
 clean:
 	rm -rf dist out node_modules *.vsix publish
