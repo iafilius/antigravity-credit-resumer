@@ -2,7 +2,7 @@
   "name": "antigravity-credit-resumer",
   "displayName": "Antigravity Credit Auto-Resumer",
   "description": "Automatically resumes Antigravity AI Cascades when credits refill and manages model switching settings.",
-  "version": "0.5.0",
+  "version": "0.7.3",
   "publisher": "arjan",
   "engines": {
     "vscode": "^1.68.0"
@@ -60,6 +60,11 @@
           "type": "boolean",
           "default": true,
           "description": "Enable persistent logging and history files inside the active workspace under `.logs/`."
+        },
+        "antigravityCreditResumer.modelSelectionConfigKey": {
+          "type": "string",
+          "default": "gemini.model",
+          "description": "The VS Code configuration key used to read the globally selected active model, bypassing stale language server payloads."
         }
       }
     }
@@ -68,6 +73,7 @@
     "vscode:prepublish": "node esbuild.js --minify",
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
+    "verify": "node -e \"const esbuild = require('esbuild'); const Module = require('module'); const orig = Module.prototype.require; Module.prototype.require = function(id) { if (id === 'vscode') return { workspace: { getConfiguration: () => ({ get: (_k, d) => d }) }, window: {}, commands: {}, ThemeColor: class {}, MarkdownString: class {}, StatusBarAlignment: { Left: 1, Right: 2 } }; return orig.apply(this, arguments); }; esbuild.buildSync({ entryPoints: ['scripts/verify-live.ts'], bundle: true, platform: 'node', outfile: 'out/verify-live.js', external: ['vscode'] }); require('./out/verify-live.js');\"",
     "test:unit": "vitest run",
     "test:integration": "npx tsc && node ./out/tests/run-integration.js",
     "test": "npm run test:unit && npm run test:integration"

@@ -11,7 +11,7 @@ Depending on your choice of settings, it either **waits for credit quotas to ref
 1.  **Process Discovery**: Automatically scans local processes to find running instances of the Antigravity Language Server and extracts their CSRF tokens.
 2.  **Port Mapping**: Discovers the dynamic local HTTPS/gRPC ports that the target processes are listening on.
 3.  **Credit Status Monitoring**: Queries the local Connect RPC `/GetUserStatus` endpoint to monitor prompt/flow credits and individual model quotas.
-4.  **Model Detection**: Automatically tracks which AI model is currently active in the IDE using a multi-signal heuristic — combining trajectory metadata, quota consumption deltas, and configuration data. Updates within one polling tick after you send a message on a newly selected model.
+4.  **Model Detection**: Automatically tracks which AI model is currently active in the IDE using a multi-signal heuristic — combining explicit configuration, transcript settings injection, and quota consumption deltas. Updates within one polling tick after you send a message on a newly selected model.
 5.  **Auto-Resume Cascade**: Depending on your chosen settings (`stick` mode), waits for model credits to refresh and then automatically sends `"continue"` (or your custom prompt) to resume active conversations/cascades.
 6.  **Smart Model Switching**: In `auto` mode, automatically switches to another model with available credits when the current model is exhausted, and then resumes the active cascade immediately.
 7.  **Persistent Logging**: Mirrors all activity to `.logs/resumer-debug.log` and maintains an append-only resumption history at `.logs/resumer-history.md` inside the active workspace.
@@ -77,7 +77,7 @@ Run the following command in the extension directory to install dependencies, co
 ```bash
 make package
 ```
-This generates a package file named `antigravity-credit-resumer-0.5.0.vsix` in your root directory.
+This generates a package file named `antigravity-credit-resumer-0.7.3.vsix` in your root directory.
 
 ### Step 2: Install in the IDE
 You can install the packaged extension directly using the Makefile:
@@ -87,7 +87,7 @@ make install-ide
 Alternatively, to install it manually through the UI:
 1.  Open the Command Palette (`Cmd+Shift+P` on macOS or `Ctrl+Shift+P` on Windows/Linux).
 2.  Search for and run: **`Extensions: Install from VSIX...`**
-3.  Choose the generated `antigravity-credit-resumer-0.5.0.vsix` file.
+3.  Choose the generated `antigravity-credit-resumer-0.7.3.vsix` file.
 4.  Reload the window to activate.
 
 ---

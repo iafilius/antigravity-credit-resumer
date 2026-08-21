@@ -30,50 +30,36 @@ The function `resolveActiveModelId()` in [`src/auto-resumer.ts`](../src/auto-res
 resolveActiveModelId()  priority waterfall
 ═══════════════════════════════════════════════════════════════
 
-  STEP 1 ▸ Workspace-Scoped Trajectory Inspection
+  STEP 1 ▸ Explicit VS Code Configuration
   ──────────────────────────────────────────────
-  • Fetch all trajectories from GetAllCascadeTrajectories
-  • Filter to those matching the target process workspaceId
-  • From matching trajectories, pick the one with the latest
-    lastModifiedTime or lastUserInputTime timestamp
-  • Read its requestedModel.modelOrAlias.model field
-  ✓ RETURN if a model ID is found
+  • Read configuration value from gemini.model (or custom key)
+  ✓ RETURN if set (bypasses all heuristics)
 
-  STEP 2 ▸ Quota Delta Tracking
+  STEP 2 ▸ Active Transcript Tail
   ──────────────────────────────────────────────
-  • Compare current remainingFraction for each model against
-    lastModelQuotas snapshot from the previous tick
-  • If any model's quota decreased by > 0.01% since last tick,
-    it consumed tokens → that model is active
-  ✓ RETURN the model whose quota dropped
+  • Locate latest conversation transcript on disk
+  • Scan tail for <USER_SETTINGS_CHANGE> settings injection blocks
+  ✓ RETURN the newly selected model ID if found
 
-  STEP 3 ▸ Explicit UI Switch Detection
+  STEP 3 ▸ Last Active Model (Sticky State)
   ──────────────────────────────────────────────
-  • Read defaultOverrideModelConfig from GetUserStatus response
-  • If it differs from lastSelectedModel → user switched in UI
-  ✓ RETURN defaultOverrideModelConfig
-  ⚠ In practice this step rarely fires — see Known Limitation below
+  • If a model was already active in the previous tick, preserve it
+  ✓ RETURN lastActiveModelId
 
-  STEP 4 ▸ Last Active Model Persistence
+  STEP 4 ▸ Quota Delta Tracking
   ──────────────────────────────────────────────
-  • If lastSelectedModel has quota < 99.9% (it has been used)
-    AND no stronger signal overrides it → preserve it
-  ✓ RETURN lastSelectedModel
-  ⚠ This is the "sticky lock" — the most common source of
-    apparent "wrong model" display between model switches
+  • Compare current model quotas against previous tick
+  • If a model's remaining fraction decreased, it was used
+  ✓ RETURN that model
 
-  STEP 5 ▸ In-Use Fallback (no prior state)
+  STEP 5 ▸ Global Default Override
   ──────────────────────────────────────────────
-  • Only fires when no lastSelectedModel has been established yet
-    (e.g. first tick after extension activation)
-  • If defaultOverrideModelConfig is at 100% quota but another
-    model is at < 99.9% → that other model is actively being used
-  ✓ RETURN the < 99.9% model
+  • Check defaultOverrideModelConfig from GetUserStatus response
+  ✓ RETURN defaultOverrideModelConfig if valid
 
-  STEP 6 ▸ Default Fallback
+  STEP 6 ▸ Fallback
   ──────────────────────────────────────────────
-  • Return defaultOverrideModelConfig if set,
-    otherwise the first model in the quota list
+  • Return the first available model from the status list
 ```
 
 ---
@@ -82,29 +68,30 @@ resolveActiveModelId()  priority waterfall
 
 When multiple VS Code windows are open simultaneously (each for a different project), all windows share the same language server process and the same trajectory pool. Without workspace scoping, a trajectory from Window A could incorrectly dominate model detection for Window B.
 
-**How it works:** Each detected process has a `workspaceId` derived from the URI of the workspace root folder (e.g. `file_Users_arjan_personal_antigravity-credit-resumer`). During Step 1, the extension only evaluates trajectories whose `workspaceFolderAbsoluteUri` matches this ID. Trajectories from other workspaces are silently ignored.
+**How it works:** Each detected process has a `workspaceId` derived from the URI of the workspace root folder (e.g. `file_Users_arjan_personal_antigravity-credit-resumer`). During Step 2, the extension locates the active transcript for the current workspace by matching the workspace URI in step 0 metadata. Transcripts from other workspaces are ignored.
 
 ---
 
 ## Known Limitation: Immediate UI Model Switch
 
-Switching the model in the IDE dropdown does **not** cause `defaultOverrideModelConfig` to update — it remains locked to whatever value it was initialized with. This makes Step 3 essentially a dead step in normal operation.
+Switching the active model via the chat panel's dropdown does **not** update any VS Code settings or immediately notify the backend. The dropdown selection is only sent to the Language Server when the user submits their next command.
 
 **What actually happens when you switch models:**
 
 ```
 t = 0s    User switches Gemini Flash → Claude Sonnet in dropdown
 t = 0s    Plugin still shows Gemini Flash
-           (Step 4 persistence wins: Gemini Flash has < 99.9% quota)
+           (Step 3 sticky state wins: Gemini Flash remains active)
 
 t = 0s    User sends first message on Claude Sonnet
+           (IDE writes settings change and prompt to transcript)
 
 t = 1–60s Next polling tick fires
-           Step 1: trajectory now has requestedModel = Claude Sonnet
+           Step 2: transcript tail has <USER_SETTINGS_CHANGE> for Claude Sonnet
            Plugin detects Claude Sonnet ✓
 ```
 
-**Detection latency after switch:** 0–60 seconds following the first message sent on the new model (bounded by the configured `checkInterval`). The latency is further reduced by the event-driven triggers described below.
+**Detection latency after switch:** 0–60 seconds following the first message sent on the new model (bounded by the configured `checkInterval`). If the resumer is suspended waiting for a refill, you can manually trigger resumption by typing a command (e.g., `"continue"`) in the chat panel using the newly selected model.
 
 ---
 

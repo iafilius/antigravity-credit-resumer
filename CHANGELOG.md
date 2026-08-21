@@ -4,6 +4,25 @@ All notable changes to the Antigravity Credit Auto-Resumer extension are documen
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.3] — 2026-08-21
+
+### Added
+- **Active Transcript Tail Model Resolution**: Extracts dynamic `<USER_SETTINGS_CHANGE>` settings blocks directly from active conversation transcript tails (`transcript.jsonl` / `transcript_full.jsonl`) on disk, ensuring instantaneous model detection without full file re-reading.
+- **6-Step Resolution Waterfall**: Formalized and documented model priority resolution (`explicitConfig` → `activeTranscript` → `stickyState` → `quotaDelta` → `defaultOverride` → `fallback`).
+- **Comprehensive Documentation**: Updated `docs/model-detection.md` detailing the resolution waterfall, workspace scoping, and documented the single-message latency for UI dropdown model switching.
+- **Package Optimization**: Added `.vscodeignore` to exclude development fixtures, tests, and specs from production `.vsix` packaging.
+
+### Fixed
+- **UI Model Regex Termination**: Enhanced `<USER_SETTINGS_CHANGE>` regex parser to cleanly terminate before trailing system instructions (such as `" No need to comment..."`).
+- **Status Bar Tooltip Reset Formatting**: Fixed model quota tooltip formatters for relative reset countdowns.
+
+## [0.7.1] — 2026-08-20
+
+### Added
+- **On-Disk Workspace Trajectory Discovery**: Discovers conversation transcripts directly from `~/.gemini/antigravity-ide/brain/` when language server RPC `GetAllCascadeTrajectories` returns empty or yields no workspace matches.
+- **Strict `USER_INPUT` Step Filtering**: Ignores tool output steps (such as `VIEW_FILE` or diffs) when parsing `<USER_SETTINGS_CHANGE>` backwards in conversation transcripts.
+- **Shared-Quota Generation Ordering**: Prioritizes modern model generations (e.g. `3.7 Flash` > `3.6 Flash` > `3.5 Flash`) during in-use fallback resolution across shared quota pools.
+
 ## [0.5.0] — 2026-08-09
 
 ### Added

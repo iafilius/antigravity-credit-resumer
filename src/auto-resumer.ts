@@ -2,8 +2,10 @@ import * as https from 'https';
 import * as vscode from 'vscode';
 import { DetectedProcess } from './process-detector';
 import { UserCreditsStatus, ModelQuotaInfo } from './credit-monitor';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { appendToLogFile } from './file-logger';
-
 interface ResumerState {
   modelExhausted: boolean;
   waitingForRefill: boolean;
@@ -21,7 +23,7 @@ export class AutoResumer {
   private extensionVersion: string;
   private states = new Map<number, ResumerState>();
 
-  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.5.0') {
+  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.7.3') {
     this.activityChannel = activityChannel;
     this.debugChannel = debugChannel;
     this.statusBarItem = statusBarItem;
@@ -66,10 +68,18 @@ export class AutoResumer {
     }
 
     // 1. Identify currently active/selected model dynamically
+    const configKey = config.get<string>('modelSelectionConfigKey', 'gemini.model');
+    const explicitConfigModelId = vscode.workspace.getConfiguration().get<string>(configKey);
+
     const rawTrajectories = await this.getAllTrajectories(proc);
-    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId);
+    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId, explicitConfigModelId);
     if (!currentModelId) {
       return;
+    }
+
+    const isDebugEnabled = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('debugLogging', false);
+    if (isDebugEnabled) {
+      this.log(`Pid ${proc.pid}: Active Model resolved as ${currentModelId}`);
     }
 
     if (state.lastSelectedModel !== currentModelId) {
@@ -258,7 +268,25 @@ export class AutoResumer {
     const map = extractTrajectoryMap(rawTrajectories);
     const allIds = Object.keys(map);
 
-    if (allIds.length === 0) {
+    // Filter trajectories by workspace
+    let candidateEntries = allIds
+      .map(id => ({ id, traj: map[id] }))
+      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
+
+    this.log(`Pid ${proc.pid}: Found ${allIds.length} total trajectories from RPC, ${candidateEntries.length} matched workspace (${proc.workspaceId || 'global'}).`);
+
+    if (candidateEntries.length === 0) {
+      const diskTraj = findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId);
+      if (diskTraj) {
+        this.log(`Pid ${proc.pid}: Discovered active workspace trajectory on disk: ${diskTraj.id}`);
+        candidateEntries = [{ id: diskTraj.id, traj: { trajectoryId: diskTraj.id, lastModifiedTime: new Date(diskTraj.mtime).toISOString() } }];
+      } else if (allIds.length > 0) {
+        this.log(`Pid ${proc.pid}: No workspace-matched trajectories found; falling back to all available trajectories.`);
+        candidateEntries = allIds.map(id => ({ id, traj: map[id] }));
+      }
+    }
+
+    if (candidateEntries.length === 0) {
       this.log(`Pid ${proc.pid}: No trajectories found to resume (raw keys=${Object.keys(rawTrajectories || {}).join(',')}).`);
       const now = new Date().toLocaleString();
       appendToLogFile(
@@ -266,18 +294,6 @@ export class AutoResumer {
         `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | No active trajectories found to resume | Idle |\n`
       );
       return false;
-    }
-
-    // Filter trajectories by workspace
-    const candidateEntries = allIds
-      .map(id => ({ id, traj: map[id] }))
-      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
-
-    this.log(`Pid ${proc.pid}: Found ${allIds.length} total trajectories, ${candidateEntries.length} matched workspace (${proc.workspaceId || 'global'}).`);
-
-    if (candidateEntries.length === 0) {
-      this.log(`Pid ${proc.pid}: No workspace-matched trajectories found; falling back to all available trajectories.`);
-      candidateEntries.push(...allIds.map(id => ({ id, traj: map[id] })));
     }
 
     // Find the most recently modified trajectory
@@ -538,6 +554,68 @@ export function getShortModelLabel(label: string): string {
   return cleaned || label.split(' ').slice(0, 2).join(' ');
 }
 
+export interface DiskTrajectoryInfo {
+  id: string;
+  mtime: number;
+  transcriptPath: string;
+}
+
+export function findLatestWorkspaceTrajectoryOnDisk(workspaceId?: string, customHomeDir?: string): DiskTrajectoryInfo | null {
+  try {
+    const brainDir = path.join(customHomeDir || os.homedir(), '.gemini', 'antigravity-ide', 'brain');
+    if (!fs.existsSync(brainDir)) return null;
+
+    const entries = fs.readdirSync(brainDir, { withFileTypes: true });
+    const candidates: DiskTrajectoryInfo[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.') || entry.name.includes('media') || entry.name.includes('scratch')) continue;
+
+      const dirPath = path.join(brainDir, entry.name);
+      const candidateFiles = ['transcript.jsonl', 'transcript_full.jsonl'];
+      for (const fileName of candidateFiles) {
+        const transcriptPath = path.join(dirPath, '.system_generated', 'logs', fileName);
+        try {
+          if (fs.existsSync(transcriptPath)) {
+            const stat = fs.statSync(transcriptPath);
+            candidates.push({ id: entry.name, mtime: stat.mtimeMs, transcriptPath });
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+
+    // Sort newest transcript file first
+    candidates.sort((a, b) => b.mtime - a.mtime);
+
+    const procNorm = normalizeWorkspaceString(workspaceId || '');
+
+    for (const candidate of candidates.slice(0, 30)) {
+      try {
+        if (!procNorm || procNorm === 'global') {
+          return candidate;
+        }
+
+        // Fast check: Read up to 8KB from the head of the file to inspect workspace metadata in step 0
+        const fd = fs.openSync(candidate.transcriptPath, 'r');
+        const buffer = Buffer.alloc(8192);
+        const bytesRead = fs.readSync(fd, buffer, 0, 8192, 0);
+        fs.closeSync(fd);
+
+        if (bytesRead > 0) {
+          const headText = buffer.toString('utf-8', 0, bytesRead);
+          const headNorm = normalizeWorkspaceString(headText);
+          if (headNorm.includes(procNorm) || procNorm.includes(headNorm)) {
+            return candidate;
+          }
+        }
+      } catch (e) {}
+    }
+  } catch (err) {}
+  return null;
+}
+
 export function extractTrajectoryMap(rawResponse: any): Record<string, any> {
   if (!rawResponse) return {};
   if (rawResponse.trajectorySummaries && typeof rawResponse.trajectorySummaries === 'object') {
@@ -546,18 +624,20 @@ export function extractTrajectoryMap(rawResponse: any): Record<string, any> {
   return typeof rawResponse === 'object' ? rawResponse : {};
 }
 
+export function normalizeWorkspaceString(str: string): string {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .replace(/^file:\/\//, '')
+    .replace(/^file_/, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
 export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any): boolean {
   if (!procWorkspaceId) return true; // Global process or no workspace context
 
-  const cleanWorkspaceString = (str: string): string => {
-    let s = str.replace(/^file:\/\//, '');
-    if (s.startsWith('file_')) {
-      s = '/' + s.substring(5).replace(/_/g, '/');
-    }
-    return s.toLowerCase();
-  };
-
-  const procPath = cleanWorkspaceString(procWorkspaceId);
+  const procNorm = normalizeWorkspaceString(procWorkspaceId);
+  if (!procNorm) return true;
 
   const workspaceObjects = traj?.workspaces || [];
   const metadataUris = traj?.trajectoryMetadata?.workspaceUris || [];
@@ -566,13 +646,145 @@ export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any)
     ...workspaceObjects.map((w: any) => w.workspaceFolderAbsoluteUri || ''),
     ...metadataUris,
   ].filter(Boolean);
-
   if (uris.length === 0) return true; // No workspace restrictions on trajectory
 
   return uris.some((u) => {
-    const cleanUri = cleanWorkspaceString(u);
-    return cleanUri.includes(procPath) || procPath.includes(cleanUri);
+    const uriNorm = normalizeWorkspaceString(u);
+    return uriNorm.includes(procNorm) || procNorm.includes(uriNorm);
   });
+}
+
+export function isCurrentWorkspaceProcess(proc: DetectedProcess, currentWorkspaceFsPath?: string): boolean {
+  if (!currentWorkspaceFsPath) {
+    // If no workspace folder is open, match global or any process without a workspaceId
+    return !proc.workspaceId || proc.workspaceId.toLowerCase() === 'global';
+  }
+  if (!proc.workspaceId) return false;
+  const currentNorm = normalizeWorkspaceString(currentWorkspaceFsPath);
+  const procNorm = normalizeWorkspaceString(proc.workspaceId);
+  return currentNorm.includes(procNorm) || procNorm.includes(currentNorm);
+}
+
+export function readActiveTranscriptTail(transcriptPath: string, maxBytes: number = 65536): string | null {
+  try {
+    if (!fs.existsSync(transcriptPath)) return null;
+    const stat = fs.statSync(transcriptPath);
+    if (stat.size === 0) return null;
+
+    const fd = fs.openSync(transcriptPath, 'r');
+
+    if (stat.size <= maxBytes) {
+      const buffer = Buffer.alloc(stat.size);
+      const bytesRead = fs.readSync(fd, buffer, 0, stat.size, 0);
+      fs.closeSync(fd);
+      return buffer.toString('utf-8', 0, bytesRead);
+    }
+
+    // Read head 16KB for session start settings
+    const headBytesToRead = Math.min(16384, stat.size);
+    const headBuffer = Buffer.alloc(headBytesToRead);
+    const headBytes = fs.readSync(fd, headBuffer, 0, headBytesToRead, 0);
+    const headStr = headBuffer.toString('utf-8', 0, headBytes);
+
+    // Read tail 64KB for recent turns
+    const tailOffset = stat.size - maxBytes;
+    const tailBuffer = Buffer.alloc(maxBytes);
+    const tailBytes = fs.readSync(fd, tailBuffer, 0, maxBytes, tailOffset);
+    const tailStr = tailBuffer.toString('utf-8', 0, tailBytes);
+
+    fs.closeSync(fd);
+    return `${headStr}\n${tailStr}`;
+  } catch (err) {}
+  return null;
+}
+
+export function parseModelFromSettingsChange(content: string, models: ModelQuotaInfo[] = []): string | null {
+  if (!content) return null;
+
+  const regex = /<USER_SETTINGS_CHANGE>[\s\S]*?`?Model Selection`?\s+from\s+.*?\s+to\s+([a-zA-Z0-9\s()._-]+?)\.(?!\d)/gi;
+  const lines = content.split('\n');
+
+  let foundJsonStep = false;
+
+  // Scan lines backwards (latest turns first)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj.type === 'USER_INPUT' && typeof obj.content === 'string' && obj.content.includes('USER_SETTINGS_CHANGE')) {
+          foundJsonStep = true;
+          regex.lastIndex = 0;
+          let match: RegExpExecArray | null;
+          let latestInStep: string | null = null;
+          while ((match = regex.exec(obj.content)) !== null) {
+            if (match[1]) {
+              const rawLabel = match[1].trim().replace(/^`|`$/g, '').replace(/\.$/, '').trim();
+              const mappedId = mapModelLabelToModelId(rawLabel, models);
+              if (mappedId) {
+                latestInStep = mappedId;
+              }
+            }
+          }
+          if (latestInStep) {
+            return latestInStep;
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Fallback for raw non-JSON text (e.g. unit test mocks or plain strings)
+  if (!foundJsonStep) {
+    regex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let lastModelId: string | null = null;
+    while ((match = regex.exec(content)) !== null) {
+      if (match[1]) {
+        const rawLabel = match[1].trim().replace(/^`|`$/g, '').replace(/\.$/, '').trim();
+        const mappedId = mapModelLabelToModelId(rawLabel, models);
+        if (mappedId) {
+          lastModelId = mappedId;
+        }
+      }
+    }
+    if (lastModelId) return lastModelId;
+  }
+
+  return null;
+}
+
+export function mapModelLabelToModelId(label: string, models: ModelQuotaInfo[] = []): string | null {
+  if (!label) return null;
+  const trimmed = label.trim();
+  if (trimmed.startsWith('<') || trimmed.includes('\\') || trimmed.includes('lines of')) return null;
+  
+  // 1. Direct match on model ID
+  const directModel = models.find(m => m.model === trimmed);
+  if (directModel) return directModel.model;
+
+  // 2. Direct match on label
+  const directLabel = models.find(m => m.label?.toLowerCase() === trimmed.toLowerCase());
+  if (directLabel) return directLabel.model;
+
+  // 3. Normalized alphanumeric match
+  const normLabel = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (normLabel && normLabel.length >= 3) {
+    for (const m of models) {
+      const normMLabel = (m.label || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normMModel = (m.model || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (normMLabel && (normMLabel.includes(normLabel) || normLabel.includes(normMLabel))) {
+        return m.model;
+      }
+      if (normMModel && (normMModel.includes(normLabel) || normLabel.includes(normMModel))) {
+        return m.model;
+      }
+    }
+  }
+
+  return null;
 }
 
 export function resolveActiveModelId(
@@ -580,37 +792,38 @@ export function resolveActiveModelId(
   lastModelQuotas?: Map<string, number>,
   lastActiveModelId?: string,
   rawTrajectories?: any,
-  workspaceId?: string
+  workspaceId?: string,
+  explicitConfigModelId?: string,
+  customHomeDir?: string
 ): string {
-  // 1. Workspace-Scoped Trajectory Metadata Inspection
-  if (rawTrajectories) {
-    const trajectoryMap = extractTrajectoryMap(rawTrajectories);
-    const ids = Object.keys(trajectoryMap);
-    if (ids.length > 0) {
-      let maxTime = 0;
-      let latestTrajModel = '';
-      for (const id of ids) {
-        const traj = trajectoryMap[id];
-        if (workspaceId && !matchesWorkspace(workspaceId, traj)) {
-          continue;
-        }
-        const timeStr = traj?.lastModifiedTime || traj?.lastUserInputTime || traj?.trajectoryMetadata?.createdAt || '';
-        const t = timeStr ? new Date(timeStr).getTime() : 0;
-        if (t >= maxTime) {
-          const modelId = traj?.requestedModel?.modelOrAlias?.model || traj?.modelConfig?.modelOrAlias?.model || traj?.model;
-          if (modelId) {
-            maxTime = t;
-            latestTrajModel = modelId;
-          }
-        }
-      }
-      if (latestTrajModel) {
-        return latestTrajModel;
-      }
-    }
+  // 1. Explicit VS Code Configuration (Highest Priority - Global UI Selection)
+  if (explicitConfigModelId) {
+    return explicitConfigModelId;
   }
 
-  // 2. Quota Delta Tracking: Find model whose remainingFraction decreased since last tick
+  // 2. Active Transcript Tail (<USER_SETTINGS_CHANGE> tag from latest chat session)
+  try {
+    const diskTraj = findLatestWorkspaceTrajectoryOnDisk(workspaceId, customHomeDir);
+    if (diskTraj?.transcriptPath) {
+      const content = readActiveTranscriptTail(diskTraj.transcriptPath);
+      if (content) {
+        const matchedModelId = parseModelFromSettingsChange(content, credits.models);
+        if (matchedModelId) {
+          return matchedModelId;
+        }
+      }
+    }
+  } catch (err) {
+    // Ignore transcript read errors and continue down precedence chain
+  }
+
+  // 3. Last Active Model (Sticky state)
+  // Retain the current model across ticks to avoid bouncing between models in a shared quota pool.
+  if (lastActiveModelId) {
+    return lastActiveModelId;
+  }
+
+  // 4. Quota Delta Tracking: Find model whose remainingFraction decreased since last tick
   if (lastModelQuotas) {
     for (const m of credits.models) {
       if (m.model && m.remainingFraction !== undefined) {
@@ -622,40 +835,18 @@ export function resolveActiveModelId(
     }
   }
 
-  // 3. Explicit UI Model Switch / Zero-Quota Selected Model Override
+  // 5. Global Default Override from Language Server API
   const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
-  const staticQuota = credits.models.find(m => m.model === staticDefault);
-
-  // Explicit UI Model Switch: defaultOverrideModelConfig changed from lastActiveModelId
-  if (staticDefault && staticQuota && lastActiveModelId && staticDefault !== lastActiveModelId) {
+  if (staticDefault && !staticDefault.startsWith('MODEL_PLACEHOLDER_')) {
     return staticDefault;
   }
 
-  // Zero-Quota Selected Model Override: If default override model is exhausted (<= 0.001), prefer it over cached model
-  if (staticDefault && staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction <= 0.001) {
-    return staticDefault;
+  // 6. Fallback: pick the first model from the available list
+  if (credits.models.length > 0 && credits.models[0].model) {
+    return credits.models[0].model;
   }
 
-  // 4. Last Active Model Persistence: If previous model was below 100% quota and override hasn't changed, preserve it
-  if (lastActiveModelId) {
-    const prevQuota = credits.models.find(m => m.model === lastActiveModelId);
-    if (prevQuota && prevQuota.remainingFraction !== undefined && prevQuota.remainingFraction < 0.999) {
-      return lastActiveModelId;
-    }
-  }
-
-  // 5. In-Use Model Fallback: If static default override is 100%, but another model is < 100% (e.g. Claude Sonnet at 53%), select active used model ONLY when no lastActiveModelId was set
-  if (!lastActiveModelId && staticQuota && staticQuota.remainingFraction !== undefined && staticQuota.remainingFraction >= 0.999) {
-    const activeUsedModel = credits.models.find(m => m.remainingFraction !== undefined && m.remainingFraction < 0.999);
-    if (activeUsedModel) {
-      return activeUsedModel.model;
-    }
-  }
-
-  // 6. Default Fallback
-  return staticDefault || (credits.models.length > 0 ? credits.models[0].model : '');
+  return '';
 }
-
-
 
 

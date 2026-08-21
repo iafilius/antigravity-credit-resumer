@@ -4,6 +4,7 @@ import { DetectedProcess } from './process-detector';
 export interface ModelQuotaInfo {
   label: string;
   model: string;
+  modelId?: string;
   remainingFraction?: number;
   resetTime?: string;
 }
@@ -118,6 +119,7 @@ function parseModelQuotas(status: any): ModelQuotaInfo[] {
     models.push({
       label,
       model,
+      modelId: config.modelId || undefined,
       remainingFraction: quotaInfo?.remainingFraction,
       resetTime: quotaInfo?.resetTime,
     });

@@ -37,7 +37,8 @@ validate:
 	openspec validate --all
 
 install-ide: package
-	antigravity-ide --install-extension *.vsix
+	@VERSION=$$(node -p "require('./package.json').version"); \
+	antigravity-ide --install-extension "antigravity-credit-resumer-$$VERSION.vsix" --force
 
 sync: build
 	@echo "=== 1. Preparing publish sub-repo ==="

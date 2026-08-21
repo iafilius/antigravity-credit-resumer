@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { detectProcesses } from './process-detector';
 import { queryCreditStatusForProcess } from './credit-monitor';
-import { AutoResumer } from './auto-resumer';
+import { AutoResumer, isCurrentWorkspaceProcess } from './auto-resumer';
 import { setFileLoggerOutputChannel, initializeHistoryReport, appendToLogFile, rotateDebugLog } from './file-logger';
 import { triggerDeveloperUpdate } from './developer-updater';
 
@@ -16,7 +16,7 @@ const cachedProcesses = new Map<number, any>();
 let tickCount = 0;
 
 export function activate(context: vscode.ExtensionContext) {
-  const version = context.extension?.packageJSON?.version || '0.5.0';
+  const version = context.extension?.packageJSON?.version || '0.7.3';
 
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');
@@ -114,7 +114,14 @@ function scheduleDebouncedTick() {
   }, 500);
 }
 
+let startupRetryTimer: NodeJS.Timeout | undefined;
+let startupRetryCount = 0;
+
 export function deactivate() {
+  if (startupRetryTimer) {
+    clearTimeout(startupRetryTimer);
+    startupRetryTimer = undefined;
+  }
   if (eventDebounceTimer) {
     clearTimeout(eventDebounceTimer);
     eventDebounceTimer = undefined;
@@ -143,6 +150,11 @@ function setupPolling() {
   if (pollTimer) {
     clearInterval(pollTimer);
   }
+  if (startupRetryTimer) {
+    clearTimeout(startupRetryTimer);
+    startupRetryTimer = undefined;
+  }
+  startupRetryCount = 0;
 
   const intervalSeconds = vscode.workspace
     .getConfiguration('antigravityCreditResumer')
@@ -161,9 +173,11 @@ async function pollIntervalTick() {
   if (!autoResumer) return;
 
   try {
+    const currentWorkspaceFsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
     // 1. Perform lightweight in-memory check to clean up dead cached processes
     const deadPids: number[] = [];
-    for (const pid of cachedProcesses.keys()) {
+    for (const [pid, proc] of cachedProcesses.entries()) {
       try {
         process.kill(pid, 0); // Standard POSIX check: returns true if running, throws if dead
       } catch (e: any) {
@@ -171,42 +185,67 @@ async function pollIntervalTick() {
           deadPids.push(pid);
         }
       }
+      if (!proc || !proc.ports || proc.ports.length === 0) {
+        deadPids.push(pid);
+      }
     }
     for (const pid of deadPids) {
       cachedProcesses.delete(pid);
     }
 
-    // 2. Only run shell scan (ps/lsof) if cache is empty or every 4th tick (to discover new windows)
-    const cacheIsEmpty = cachedProcesses.size === 0;
-    if (cacheIsEmpty || tickCount % 4 === 0) {
+    // 2. Check if we currently have a cached process for this window
+    let targetProcess = Array.from(cachedProcesses.values()).find(p => p.ports && p.ports.length > 0 && isCurrentWorkspaceProcess(p, currentWorkspaceFsPath));
+
+    // 3. If target process is missing from cache or every 10th tick, perform a discovery shell scan (ps/lsof)
+    if (!targetProcess || tickCount % 10 === 0) {
       autoResumer.log('Running process discovery shell scan...');
       const discovered = await detectProcesses();
+      cachedProcesses.clear();
       for (const proc of discovered) {
-        cachedProcesses.set(proc.pid, proc);
+        if (proc.ports && proc.ports.length > 0) {
+          cachedProcesses.set(proc.pid, proc);
+        }
       }
+      targetProcess = Array.from(cachedProcesses.values()).find(p => isCurrentWorkspaceProcess(p, currentWorkspaceFsPath)) || (discovered.length === 1 && discovered[0].ports.length > 0 ? discovered[0] : undefined);
     }
 
     tickCount++;
 
-    const processes = Array.from(cachedProcesses.values());
-    if (processes.length === 0) {
-      autoResumer.log('No active Antigravity Language Server processes found.');
-      // Update Status Bar to indicate no active server
+    if (!targetProcess) {
+      autoResumer.log(`No active Antigravity Language Server process found matching workspace: ${currentWorkspaceFsPath || 'global'}`);
       if (statusBarItem) {
-        statusBarItem.text = '$(credit-card) AGY: Idle';
-        statusBarItem.tooltip = 'No active Antigravity Language Server processes found';
+        statusBarItem.text = '$(credit-card) AGY: Init';
+        statusBarItem.tooltip = `Antigravity Credit Auto-Resumer is initializing (workspace: ${currentWorkspaceFsPath || 'global'})`;
+      }
+
+      // Schedule rapid sub-second retry if we are below max retries (10 retries at 500ms interval on startup)
+      if (startupRetryCount < 10) {
+        startupRetryCount++;
+        autoResumer.log(`Scheduling rapid startup retry ${startupRetryCount}/10 in 500ms...`);
+        if (startupRetryTimer) clearTimeout(startupRetryTimer);
+        startupRetryTimer = setTimeout(() => {
+          startupRetryTimer = undefined;
+          pollIntervalTick();
+        }, 500);
       }
       return;
     }
 
-    for (const proc of processes) {
-      autoResumer.log(`Processing PID ${proc.pid} (workspace: ${proc.workspaceId || 'global'})...`);
-      const credits = await queryCreditStatusForProcess(proc);
+    // Reset rapid retry count once process is successfully attached
+    startupRetryCount = 0;
 
-      if (credits) {
-        await autoResumer.processTick(proc, credits);
-      } else {
-        autoResumer.log(`Failed to query credits for PID ${proc.pid} on ports: ${proc.ports.join(', ')}`);
+    autoResumer.log(`Processing PID ${targetProcess.pid} for current workspace (${targetProcess.workspaceId || 'global'})...`);
+    const credits = await queryCreditStatusForProcess(targetProcess);
+
+    if (credits) {
+      await autoResumer.processTick(targetProcess, credits);
+    } else {
+      autoResumer.log(`Failed to query credits for PID ${targetProcess.pid} on ports: ${targetProcess.ports.join(', ')}`);
+      // Evict failed process from cache so next tick performs rediscovery
+      cachedProcesses.delete(targetProcess.pid);
+      if (statusBarItem && !statusBarItem.text.includes('cr (')) {
+        statusBarItem.text = '$(credit-card) AGY: Init';
+        statusBarItem.tooltip = `Antigravity Credit Auto-Resumer is initializing (workspace: ${currentWorkspaceFsPath || 'global'})`;
       }
     }
   } catch (err: any) {
