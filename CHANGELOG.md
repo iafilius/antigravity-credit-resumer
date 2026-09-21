@@ -4,6 +4,29 @@ All notable changes to the Antigravity Credit Auto-Resumer extension are documen
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.8] — 2026-09-21
+
+### Fixed
+- **Runtime `AGY: Init` Status Bar Halt**: Imported missing `findTargetWorkspaceProcess` in `src/extension.ts` and declared module-level reconnection retry state variables (`reconnectRetryCount`, `reconnectRetryTimer`) with proper teardown in `deactivate()`, preventing uncaught `ReferenceError` during background process discovery scans.
+- **Model Switching Refill State Reset**: Reset refill detection baseline state when switching the active model to avoid false-positive refill notifications caused by mismatched previous quota levels.
+
+### Changed
+- **Build Pipeline Verification Gate**: Hardened `package.json` `compile` and `vscode:prepublish` scripts to execute `tsc --noEmit` before bundling with esbuild, preventing unresolved identifiers or type errors from being packaged into release `.vsix` artifacts.
+
+## [0.7.7] — 2026-08-25
+
+### Added
+- **First-Class `SWITCHING_MODEL` Operational State**: Automatically reflects candidate model evaluation in the state machine, displaying `$(arrow-swap) AGY: Switching ({model})` with `statusBarItem.warningBackground` and detailed alternate candidate hover plan cards.
+- **First-Class `DISPATCHING_RESUME` Operational State**: Explicitly surfaces active continuation requests sent to language server RPC (`SendUserCascadeMessage`), displaying `$(zap) AGY: Resuming Chat...` or `$(play) AGY: Sending /resume...`.
+- **Persistent Resumption Telemetry**: Tracks `lastResumedInfo` (timestamp, target trajectory ID, target model, prompt payload, and success outcome) and displays a persistent `• Last Resumption: 🚀 Sent prompt "..." to `...` (...) at ... (Success)` telemetry row in the hover card across subsequent monitoring cycles.
+- **Structured Activity & History Logging**: Emits prominent `[AutoResumer] 🚀 DISPATCH:` entries to Activity Output Channel and appends structured rows to `resumer-history.md`.
+- **Early Refill Detection Heuristics**: Replaced rigid `resetTime` gate with fraction-jump heuristics (detecting ≥40pp delta jumps or ≥90% near-full quota replenishments) to support early hourly rate limit refills.
+
+## [0.7.4] — 2026-08-23
+
+### Changed
+- **2-Decimal Quota Precision**: Updated status bar text, model list, and hover tooltip to format quota remaining percentages with 2 decimal places (e.g. `95.34%` / `95.64%`) for high-precision rate limit visibility.
+
 ## [0.7.3] — 2026-08-21
 
 ### Added

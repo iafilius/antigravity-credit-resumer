@@ -2,7 +2,7 @@
   "name": "antigravity-credit-resumer",
   "displayName": "Antigravity Credit Auto-Resumer",
   "description": "Automatically resumes Antigravity AI Cascades when credits refill and manages model switching settings.",
-  "version": "0.7.3",
+  "version": "0.7.8",
   "publisher": "arjan",
   "engines": {
     "vscode": "^1.68.0"
@@ -70,8 +70,8 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "node esbuild.js --minify",
-    "compile": "node esbuild.js",
+    "vscode:prepublish": "tsc --noEmit && node esbuild.js --minify",
+    "compile": "tsc --noEmit && node esbuild.js",
     "watch": "node esbuild.js --watch",
     "verify": "node -e \"const esbuild = require('esbuild'); const Module = require('module'); const orig = Module.prototype.require; Module.prototype.require = function(id) { if (id === 'vscode') return { workspace: { getConfiguration: () => ({ get: (_k, d) => d }) }, window: {}, commands: {}, ThemeColor: class {}, MarkdownString: class {}, StatusBarAlignment: { Left: 1, Right: 2 } }; return orig.apply(this, arguments); }; esbuild.buildSync({ entryPoints: ['scripts/verify-live.ts'], bundle: true, platform: 'node', outfile: 'out/verify-live.js', external: ['vscode'] }); require('./out/verify-live.js');\"",
     "test:unit": "vitest run",

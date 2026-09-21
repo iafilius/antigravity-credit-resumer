@@ -1,19 +1,41 @@
 import * as https from 'https';
 import * as vscode from 'vscode';
-import { DetectedProcess } from './process-detector';
+import { DetectedProcess, hasProcessOpenFileInWorkspace } from './process-detector';
 import { UserCreditsStatus, ModelQuotaInfo } from './credit-monitor';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { appendToLogFile } from './file-logger';
+export type ResumerOperationalState =
+  | 'INITIALIZING'
+  | 'DOWNCOUNTING'
+  | 'LOW_QUOTA'
+  | 'SWITCHING_MODEL'
+  | 'WAITING_FOR_REFILL'
+  | 'REFILL_DETECTED'
+  | 'DISPATCHING_RESUME'
+  | 'RESUMING'
+  | 'API_DARK';
+
+export interface ResumptionEventInfo {
+  timestamp: string;
+  trajectoryId: string;
+  modelId: string;
+  prompt: string;
+  success: boolean;
+}
+
 interface ResumerState {
   modelExhausted: boolean;
   waitingForRefill: boolean;
   lastSelectedModel: string;
+  currentState: ResumerOperationalState;
+  activeTrajectoryId?: string;
   lastPromptCredits?: number;
   lastFlowCredits?: number;
   lastRemainingFraction?: number;
   lastModelQuotas?: Map<string, number>;
+  lastResumedInfo?: ResumptionEventInfo;
 }
 
 export class AutoResumer {
@@ -22,12 +44,67 @@ export class AutoResumer {
   private statusBarItem?: vscode.StatusBarItem;
   private extensionVersion: string;
   private states = new Map<number, ResumerState>();
+  private lastPollTime: number = Date.now();
+  private pollIntervalMs: number = 60000;
+  private currentOperationalState: ResumerOperationalState = 'INITIALIZING';
 
-  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.7.3') {
+  constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.7.7') {
     this.activityChannel = activityChannel;
     this.debugChannel = debugChannel;
     this.statusBarItem = statusBarItem;
     this.extensionVersion = extensionVersion;
+  }
+
+  public recordPoll(intervalSeconds?: number) {
+    this.lastPollTime = Date.now();
+    if (intervalSeconds) {
+      this.pollIntervalMs = intervalSeconds * 1000;
+    }
+  }
+
+  public getOperationalState(pid?: number): ResumerOperationalState {
+    if (pid && this.states.has(pid)) {
+      return this.states.get(pid)!.currentState;
+    }
+    return this.currentOperationalState;
+  }
+
+  public setOperationalState(state: ResumerOperationalState, proc?: DetectedProcess) {
+    this.currentOperationalState = state;
+    if (proc) {
+      const pState = this.states.get(proc.pid);
+      if (pState) {
+        pState.currentState = state;
+      }
+    }
+  }
+
+  public handleApiDark(proc?: DetectedProcess) {
+    const isWaiting = proc ? this.isWaitingForRefill(proc.pid) : false;
+    this.setOperationalState('API_DARK', proc);
+    if (this.statusBarItem) {
+      const showStatusBar = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showStatusBar', true);
+      if (showStatusBar) {
+        this.statusBarItem.text = `$(plug) AGY: Reconnecting...`;
+        this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        const nextPollMs = Math.max(0, (this.lastPollTime + this.pollIntervalMs) - Date.now());
+        const nextPollSec = Math.ceil(nextPollMs / 1000);
+
+        const tooltip = new vscode.MarkdownString(
+          `**Antigravity Credit Auto-Resumer (v${this.extensionVersion})**\n\n` +
+          `### ⏱ Auto-Resumer Plan: [API_DARK / RECONNECTING]\n` +
+          `• **Current State**: 🟡 Disconnected / API Dark — Port query failed\n` +
+          `• **Refill Watch**: ${isWaiting ? '🔴 Armed (Waiting for Refill)' : '⚪ Inactive'}\n` +
+          `• **Next Reconnection Attempt**: in ~${nextPollSec}s (interval: ${this.pollIntervalMs / 1000}s)\n` +
+          `• **Action Plan**: Retrying language server process & port discovery on next tick.\n\n` +
+          `---\n\n` +
+          `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate) | *v${this.extensionVersion}*`
+        );
+        tooltip.isTrusted = true;
+        this.statusBarItem.tooltip = tooltip;
+        this.statusBarItem.show();
+      }
+    }
   }
 
   public log(msg: string) {
@@ -37,6 +114,11 @@ export class AutoResumer {
       this.debugChannel.appendLine(`[AutoResumer Debug] ${msg}`);
       appendToLogFile('resumer-debug.log', logStr);
     }
+  }
+
+  /** Returns true when the given PID is currently armed and waiting for a quota refill. */
+  public isWaitingForRefill(pid: number): boolean {
+    return this.states.get(pid)?.waitingForRefill ?? false;
   }
 
   public async processTick(proc: DetectedProcess, credits: UserCreditsStatus) {
@@ -51,6 +133,7 @@ export class AutoResumer {
         modelExhausted: false,
         waitingForRefill: false,
         lastSelectedModel: '',
+        currentState: 'INITIALIZING',
       };
       this.states.set(proc.pid, state);
     }
@@ -72,19 +155,36 @@ export class AutoResumer {
     const explicitConfigModelId = vscode.workspace.getConfiguration().get<string>(configKey);
 
     const rawTrajectories = await this.getAllTrajectories(proc);
+    
+    // Find active trajectory for this workspace
+    const map = extractTrajectoryMap(rawTrajectories);
+    const candidateEntries = Object.keys(map)
+      .map(id => ({ id, traj: map[id] }))
+      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
+    candidateEntries.sort((a, b) => {
+      const timeA = new Date(a.traj?.lastModifiedTime || 0).getTime();
+      const timeB = new Date(b.traj?.lastModifiedTime || 0).getTime();
+      return timeB - timeA;
+    });
+    state.activeTrajectoryId = candidateEntries[0]?.id || findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId)?.id;
+
     const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId, explicitConfigModelId);
     if (!currentModelId) {
+      // Cannot resolve model yet — still update status bar with credit counts so it doesn't stay stuck on 'Init'
+      if (this.statusBarItem) {
+        const showStatusBar = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showStatusBar', true);
+        if (showStatusBar) {
+          this.statusBarItem.text = `$(credit-card) AGY: ${credits.availablePromptCredits}p/${credits.availableFlowCredits}a cr`;
+          this.statusBarItem.backgroundColor = undefined;
+          this.statusBarItem.show();
+        }
+      }
       return;
     }
 
     const isDebugEnabled = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('debugLogging', false);
     if (isDebugEnabled) {
       this.log(`Pid ${proc.pid}: Active Model resolved as ${currentModelId}`);
-    }
-
-    if (state.lastSelectedModel !== currentModelId) {
-      this.activityChannel.appendLine(`[AutoResumer] Pid ${proc.pid}: Selected model changed to ${currentModelId}`);
-      state.lastSelectedModel = currentModelId;
     }
 
     // Record current model quotas for delta tracking on subsequent ticks
@@ -101,65 +201,43 @@ export class AutoResumer {
     const hasRemainingFraction = currentModelQuota && currentModelQuota.remainingFraction !== undefined;
     const remainingFraction = hasRemainingFraction ? currentModelQuota!.remainingFraction! : 1.0;
 
-    const isExhausted = remainingFraction <= 0.001; // Quota <= 0%
-    const isLowQuota = remainingFraction <= 0.05; // Quota <= 5%
+    // Hard-zero guard: language server's remainingFraction is a server-side cached float
+    // that can lag several minutes behind real consumption. The integer credit counters
+    // update faster — if either hits 0, treat as exhausted immediately.
+    const hardZero = credits.availablePromptCredits === 0 || credits.availableFlowCredits === 0;
+    const isExhausted = remainingFraction <= 0.001 || hardZero; // Quota <= 0% or live counter zero
+    const isLowQuota = remainingFraction <= 0.05 || hardZero;   // Quota <= 5% or live counter zero
 
-    // Update Status Bar Item
-    if (this.statusBarItem) {
-      const showStatusBar = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showStatusBar', true);
-      if (showStatusBar) {
-        const modelLabel = currentModelQuota?.label || currentModelId;
-        const shortModelName = getShortModelLabel(modelLabel);
-        const quotaPercentageText = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(0)}%` : '∞';
-        this.statusBarItem.text = `$(credit-card) AGY: ${credits.availablePromptCredits}p/${credits.availableFlowCredits}a cr (${shortModelName}: ${quotaPercentageText})`;
-        
-        const quotaPercentage = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(1)}%` : 'Unlimited';
-        const resetStr = currentModelQuota?.resetTime ? formatResetTime(currentModelQuota.resetTime, currentModelQuota.remainingFraction) : (currentModelQuota?.remainingFraction !== undefined && currentModelQuota.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
+    if (state.lastSelectedModel !== currentModelId) {
+      const prevModel = state.lastSelectedModel;
+      this.activityChannel.appendLine(`[AutoResumer] Pid ${proc.pid}: Selected model changed from ${prevModel || 'none'} to ${currentModelId}`);
+      state.lastSelectedModel = currentModelId;
 
-        // Construct list of all model quotas
-        const modelQuotasLines = credits.models.map(m => {
-          const isCurrent = m.model === currentModelId;
-          const labelStr = isCurrent ? `**${m.label} (Active)**` : m.label;
-          
-          let detailStr = 'Unlimited';
-          if (m.remainingFraction !== undefined) {
-            const pct = (m.remainingFraction * 100).toFixed(1);
-            const resetVal = m.resetTime ? formatResetTime(m.resetTime, m.remainingFraction) : (m.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
-            detailStr = `${pct}% (refills ${resetVal})`;
-          }
-          return `• ${labelStr}: ${detailStr}`;
-        }).join('\n');
-
-        const tooltip = new vscode.MarkdownString(
-          `**Antigravity Credit Auto-Resumer (v${this.extensionVersion})**\n\n` +
-          `### 👤 Active Model Status\n` +
-          `• **Model**: ${modelLabel}\n` +
-          `• **Quota Remaining**: ${quotaPercentage}\n` +
-          `• **Next Reset / Refill**: ${resetStr}\n\n` +
-          `---\n\n` +
-          `### 💳 Credit Pools (Current / Monthly)\n` +
-          `• **Prompt Credits**: ${credits.availablePromptCredits} cr${credits.monthlyPromptCredits ? ` / ${credits.monthlyPromptCredits.toLocaleString()} cr` : ''}\n` +
-          `• **AI Credits**: ${credits.availableFlowCredits} cr${credits.monthlyFlowCredits ? ` / ${credits.monthlyFlowCredits.toLocaleString()} cr` : ''}\n\n` +
-          `---\n\n` +
-          `### 📊 All Model Quotas (Rate Limits)\n` +
-          `${modelQuotasLines}\n\n` +
-          `---\n\n` +
-          `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate) | *v${this.extensionVersion}*`
-        );
-        tooltip.isTrusted = true;
-        this.statusBarItem.tooltip = tooltip;
-
-        if (isExhausted) {
-          this.statusBarItem.text = `$(alert) AGY: Refill Pending`;
-          this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
-        } else {
-          this.statusBarItem.backgroundColor = undefined;
+      // If the newly selected model has available credits (> 5%), disarm refill watch
+      if (!isLowQuota) {
+        if (state.waitingForRefill) {
+          const pct = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(2)}%` : '100.00%';
+          this.log(`Pid ${proc.pid}: Model switched to ${currentModelId} with ${pct} credits. Disarming refill watch.`);
+          this.activityChannel.appendLine(`[AutoResumer] Pid ${proc.pid}: Model switched to ${currentModelId} with available quota (${pct}). Disarming refill watch.`);
+          state.waitingForRefill = false;
         }
-        this.statusBarItem.show();
-      } else {
-        this.statusBarItem.hide();
+        state.modelExhausted = false;
+        state.lastRemainingFraction = remainingFraction;
       }
     }
+
+    // Update operational state
+    if (state.waitingForRefill || isExhausted) {
+      state.currentState = 'WAITING_FOR_REFILL';
+    } else if (isLowQuota) {
+      state.currentState = 'LOW_QUOTA';
+    } else {
+      state.currentState = 'DOWNCOUNTING';
+    }
+    this.currentOperationalState = state.currentState;
+
+    // Update Status Bar Item
+    this.updateStatusBarAndTooltip(proc, credits, state, currentModelId, currentModelQuota, remainingFraction, hasRemainingFraction);
 
     // Only log model quota ticks if it changed significantly (>= 1%) or state transitioned
     const fractionDiff = state.lastRemainingFraction !== undefined ? Math.abs(state.lastRemainingFraction - remainingFraction) : 1.0;
@@ -176,12 +254,12 @@ export class AutoResumer {
       state.modelExhausted = true;
 
       if (!state.waitingForRefill) {
-        this.log(`Pid ${proc.pid}: Model ${currentModelId} reached low quota (${(remainingFraction * 100).toFixed(1)}%)! Flagged waiting for refill.`);
+        this.log(`Pid ${proc.pid}: Model ${currentModelId} reached low quota (${(remainingFraction * 100).toFixed(2)}%)! Flagged waiting for refill.`);
         state.waitingForRefill = true;
         const now = new Date().toLocaleString();
         appendToLogFile(
           'resumer-history.md',
-          `| \`${proc.pid}\` | \`${now}\` | **Quota Exhausted** | Model \`${currentModelId}\` reached ${(remainingFraction * 100).toFixed(1)}% | Suspended |\n`
+          `| \`${proc.pid}\` | \`${now}\` | **Quota Exhausted** | Model \`${currentModelId}\` reached ${(remainingFraction * 100).toFixed(2)}% | Suspended |\n`
         );
       }
 
@@ -212,7 +290,15 @@ export class AutoResumer {
         const alternateModel = candidateModels[0];
 
         if (alternateModel) {
-          this.log(`Pid ${proc.pid}: Found alternate model ${alternateModel.label} (${alternateModel.model}) with remaining credits.`);
+          state.currentState = 'SWITCHING_MODEL';
+          this.currentOperationalState = 'SWITCHING_MODEL';
+          if (this.statusBarItem) {
+            const shortAltName = getShortModelLabel(alternateModel.label || alternateModel.model);
+            this.statusBarItem.text = `$(arrow-swap) AGY: Switching (${shortAltName})`;
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+          }
+
+          this.log(`Pid ${proc.pid}: Found alternate model ${alternateModel.label} (${alternateModel.model}) with remaining credits. Switching model...`);
           const now = new Date().toLocaleString();
           appendToLogFile(
             'resumer-history.md',
@@ -233,32 +319,234 @@ export class AutoResumer {
           if (success) {
             state.waitingForRefill = false;
             state.modelExhausted = false;
+            state.currentState = 'DOWNCOUNTING';
+            this.currentOperationalState = 'DOWNCOUNTING';
+          } else {
+            state.waitingForRefill = true;
+            state.currentState = 'WAITING_FOR_REFILL';
+            this.currentOperationalState = 'WAITING_FOR_REFILL';
           }
+          this.updateStatusBarAndTooltip(proc, credits, state, alternateModel.model, alternateModel, alternateModel.remainingFraction ?? 1.0, alternateModel.remainingFraction !== undefined);
         } else {
           this.log(`Pid ${proc.pid}: No alternate models with available credits found. Waiting for refill...`);
+          state.waitingForRefill = true;
+          state.currentState = 'WAITING_FOR_REFILL';
+          this.currentOperationalState = 'WAITING_FOR_REFILL';
+          this.updateStatusBarAndTooltip(proc, credits, state, currentModelId, currentModelQuota, remainingFraction, hasRemainingFraction);
         }
       }
     } else {
-      // Current model has available credits
-      const resetTimePassed = !currentModelQuota?.resetTime || isNaN(new Date(currentModelQuota.resetTime).getTime()) || new Date() >= new Date(currentModelQuota.resetTime);
-      const isRefilled = (state.waitingForRefill || (state.lastRemainingFraction !== undefined && state.lastRemainingFraction <= 0.05)) && remainingFraction >= 0.50 && resetTimePassed;
+      // Current model has available credits.
+      // Detect a genuine refill by looking for an actual measured upward jump in remainingFraction
+      // rather than a clock comparison against resetTime (which is the *next scheduled* reset
+      // boundary — a future date that blocks legitimate early refills from firing).
+      //
+      // Two signals that a real refill happened:
+      //   fractionJumped — measured fraction rose ≥40 percentage points since last recorded value
+      //   nearFull       — measured fraction is ≥90% (almost certainly a fresh quota)
+      //
+      // We require hasRemainingFraction=true to exclude the synthetic 1.0 default we use when
+      // the field is absent (the ∞ / unlimited state), which would otherwise cause a false resume.
+      const hasActualHighFraction = hasRemainingFraction && remainingFraction >= 0.50;
+      const fractionJumped = hasActualHighFraction
+        && state.lastRemainingFraction !== undefined
+        && (remainingFraction - state.lastRemainingFraction) >= 0.40;
+      const nearFull = hasActualHighFraction && remainingFraction >= 0.90;
+      const isRefilled = (state.waitingForRefill || (state.lastRemainingFraction !== undefined && state.lastRemainingFraction <= 0.05))
+        && (fractionJumped || nearFull);
+
+      // Refill-signal diagnostic: log all intermediate values whenever we are waiting and the
+      // fraction has changed ≥1pp, so post-hoc debugging doesn't require reconstructing the
+      // decision from separate log lines.
+      if (state.waitingForRefill && fractionDiff >= 0.01) {
+        const lastStr = state.lastRemainingFraction !== undefined ? state.lastRemainingFraction.toFixed(4) : 'n/a';
+        const deltaStr = state.lastRemainingFraction !== undefined
+          ? (remainingFraction - state.lastRemainingFraction).toFixed(4)
+          : 'n/a';
+        this.log(
+          `Pid ${proc.pid}: Refill check — ` +
+          `fraction=${remainingFraction.toFixed(4)}, last=${lastStr}, delta=${deltaStr}, ` +
+          `hasActualHigh=${hasActualHighFraction}, jumped=${fractionJumped}, nearFull=${nearFull} → isRefilled=${isRefilled}`
+        );
+
+        // Suspicious intermediate zone: fraction is above the exhaustion floor but below the
+        // hasActualHighFraction gate. A genuine refill always returns ~100%, so a reading in
+        // the 5–50% range while waiting is almost always a transient API artefact.
+        if (remainingFraction > 0.05 && remainingFraction < 0.50) {
+          this.log(
+            `Pid ${proc.pid}: ⚠ Suspicious intermediate fraction ${(remainingFraction * 100).toFixed(2)}% ` +
+            `while waiting for refill (expected ~100% on genuine refill). ` +
+            `May be a transient API reading — monitoring continues.`
+          );
+        }
+      }
+
       if (isRefilled) {
+        state.currentState = 'REFILL_DETECTED';
+        this.currentOperationalState = 'REFILL_DETECTED';
+        if (this.statusBarItem) {
+          const quotaPercentageText = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(2)}%` : '100.00%';
+          this.statusBarItem.text = `$(check) AGY: Refilled (${quotaPercentageText})`;
+          this.statusBarItem.backgroundColor = undefined;
+        }
+
         this.log(`Pid ${proc.pid}: Model ${currentModelId} has been refilled (remainingFraction=${remainingFraction.toFixed(4)})!`);
         const now = new Date().toLocaleString();
         appendToLogFile(
           'resumer-history.md',
-          `| \`${proc.pid}\` | \`${now}\` | **Quota Refilled** | Model \`${currentModelId}\` refilled to ${(remainingFraction * 100).toFixed(1)}% | Refilled |\n`
+          `| \`${proc.pid}\` | \`${now}\` | **Quota Refilled** | Model \`${currentModelId}\` refilled to ${(remainingFraction * 100).toFixed(2)}% | Refilled |\n`
         );
+
+        state.currentState = 'DISPATCHING_RESUME';
+        this.currentOperationalState = 'DISPATCHING_RESUME';
+        if (this.statusBarItem) {
+          this.statusBarItem.text = `$(zap) AGY: Resuming Chat...`;
+          this.statusBarItem.backgroundColor = undefined;
+        }
+
         const success = await this.resumeActiveCascade(proc, currentModelId, resumePrompt);
         if (success) {
           state.waitingForRefill = false;
+          state.currentState = 'DOWNCOUNTING';
+          this.currentOperationalState = 'DOWNCOUNTING';
         } else {
           this.log(`Pid ${proc.pid}: Resume attempt failed for model ${currentModelId}. Retaining waitingForRefill state.`);
           state.waitingForRefill = true;
+          state.currentState = 'WAITING_FOR_REFILL';
+          this.currentOperationalState = 'WAITING_FOR_REFILL';
         }
+        this.updateStatusBarAndTooltip(proc, credits, state, currentModelId, currentModelQuota, remainingFraction, hasRemainingFraction);
       }
       state.modelExhausted = false;
     }
+  }
+
+  private updateStatusBarAndTooltip(
+    proc: DetectedProcess,
+    credits: UserCreditsStatus,
+    state: ResumerState,
+    currentModelId: string,
+    currentModelQuota?: ModelQuotaInfo,
+    remainingFraction: number = 1.0,
+    hasRemainingFraction: boolean = true
+  ) {
+    if (!this.statusBarItem) {
+      return;
+    }
+
+    const showStatusBar = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showStatusBar', true);
+    if (!showStatusBar) {
+      this.statusBarItem.hide();
+      return;
+    }
+
+    const modelLabel = currentModelQuota?.label || currentModelId;
+    const shortModelName = getShortModelLabel(modelLabel);
+    const quotaPercentageText = hasRemainingFraction ? `${(remainingFraction * 100).toFixed(2)}%` : '∞';
+
+    // Status Bar text & color
+    if (state.currentState === 'WAITING_FOR_REFILL') {
+      this.statusBarItem.text = `$(alert) AGY: Refill Watch (${shortModelName}: ${quotaPercentageText})`;
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+    } else if (state.currentState === 'LOW_QUOTA') {
+      this.statusBarItem.text = `$(warning) AGY: Low Quota (${shortModelName}: ${quotaPercentageText})`;
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    } else if (state.currentState === 'SWITCHING_MODEL') {
+      this.statusBarItem.text = `$(arrow-swap) AGY: Switching (${shortModelName}: ${quotaPercentageText})`;
+      this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    } else if (state.currentState === 'DISPATCHING_RESUME' || state.currentState === 'RESUMING') {
+      this.statusBarItem.text = `$(zap) AGY: Resuming Chat...`;
+      this.statusBarItem.backgroundColor = undefined;
+    } else if (state.currentState === 'REFILL_DETECTED') {
+      this.statusBarItem.text = `$(check) AGY: Refilled (${quotaPercentageText})`;
+      this.statusBarItem.backgroundColor = undefined;
+    } else {
+      this.statusBarItem.text = `$(credit-card) AGY: ${credits.availablePromptCredits}p/${credits.availableFlowCredits}a cr (${shortModelName}: ${quotaPercentageText})`;
+      this.statusBarItem.backgroundColor = undefined;
+    }
+
+    const resetStr = currentModelQuota?.resetTime
+      ? formatResetTime(currentModelQuota.resetTime, currentModelQuota.remainingFraction)
+      : (currentModelQuota?.remainingFraction !== undefined && currentModelQuota.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
+
+    // Construct list of all model quotas
+    const modelQuotasLines = credits.models.map(m => {
+      const isCurrent = m.model === currentModelId;
+      const labelStr = isCurrent ? `**${m.label} (Active)**` : m.label;
+
+      let detailStr = 'Unlimited';
+      if (m.remainingFraction !== undefined) {
+        const pct = (m.remainingFraction * 100).toFixed(2);
+        const resetVal = m.resetTime ? formatResetTime(m.resetTime, m.remainingFraction) : (m.remainingFraction >= 0.999 ? 'Full Quota' : 'N/A');
+        detailStr = `${pct}% (refills ${resetVal})`;
+      }
+      return `• ${labelStr}: ${detailStr}`;
+    }).join('\n');
+
+    const nextPollMs = Math.max(0, (this.lastPollTime + this.pollIntervalMs) - Date.now());
+    const nextPollSec = Math.ceil(nextPollMs / 1000);
+
+    let stateTitle = '';
+    let statePlan = '';
+    let resumeReadyStr = state.activeTrajectoryId ? `\`${state.activeTrajectoryId}\` (Ready to resume)` : 'None active';
+
+    if (state.currentState === 'WAITING_FOR_REFILL') {
+      stateTitle = `🔴 Quota Depleted — Refill Watch Active`;
+      statePlan = `Auto-dispatch continuation message when quota jump ≥40% or ≥90% is detected.`;
+      resumeReadyStr = state.activeTrajectoryId ? `\`${state.activeTrajectoryId}\` (Armed for auto-resume on refill)` : 'None paused';
+    } else if (state.currentState === 'LOW_QUOTA') {
+      stateTitle = `🟡 Degradation Zone — Low Quota (${quotaPercentageText})`;
+      statePlan = `Approaching exhaustion threshold (≤5%). Will arm refill watch or auto-switch on 0%.`;
+    } else if (state.currentState === 'SWITCHING_MODEL') {
+      stateTitle = `🔀 Active Model Exhausted — Switching to Alternate Model`;
+      statePlan = `Selecting best alternate candidate model and dispatching continuation message.`;
+      resumeReadyStr = state.activeTrajectoryId ? `\`${state.activeTrajectoryId}\` (Switching target)` : 'None active';
+    } else if (state.currentState === 'DISPATCHING_RESUME' || state.currentState === 'RESUMING') {
+      stateTitle = `⚡ Dispatching Continuation Message to Active Chat`;
+      statePlan = `Transmitting resume prompt payload to active trajectory via language server RPC.`;
+      resumeReadyStr = state.activeTrajectoryId ? `\`${state.activeTrajectoryId}\` (Dispatching payload)` : 'None active';
+    } else if (state.currentState === 'REFILL_DETECTED') {
+      stateTitle = `🟢 Credit Refill Detected`;
+      statePlan = `Quota replenished. Triggering continuation message.`;
+    } else {
+      stateTitle = `🟢 Active / Downcounting (${quotaPercentageText} quota remaining)`;
+      statePlan = `Monitoring quota consumption. Will flag for refill when quota drops to 0%.`;
+    }
+
+    const lastResumedLine = state.lastResumedInfo
+      ? `• **Last Resumption**: 🚀 Sent prompt "${state.lastResumedInfo.prompt}" to \`${state.lastResumedInfo.trajectoryId.substring(0, 8)}\` (${getShortModelLabel(state.lastResumedInfo.modelId)}) at ${state.lastResumedInfo.timestamp} (${state.lastResumedInfo.success ? 'Success' : 'Failed'})\n`
+      : '';
+
+    const planSection =
+      `### ⏱ Auto-Resumer Plan: [${state.currentState}]\n` +
+      `• **Current State**: ${stateTitle}\n` +
+      `• **Next Credit Poll**: in ~${nextPollSec}s (interval: ${this.pollIntervalMs / 1000}s)\n` +
+      `• **Target Refill Window**: ${resetStr}\n` +
+      `• **Active Trajectory**: ${resumeReadyStr}\n` +
+      `${lastResumedLine}` +
+      `• **Action Plan**: ${statePlan}\n\n`;
+
+    const tooltip = new vscode.MarkdownString(
+      `**Antigravity Credit Auto-Resumer (v${this.extensionVersion})**\n\n` +
+      `${planSection}` +
+      `---\n\n` +
+      `### 👤 Active Model Status\n` +
+      `• **Model**: ${modelLabel}\n` +
+      `• **Quota Remaining**: ${hasRemainingFraction ? `${(remainingFraction * 100).toFixed(2)}%` : 'Unlimited'}\n` +
+      `• **Next Reset / Refill**: ${resetStr}\n\n` +
+      `---\n\n` +
+      `### 💳 Credit Pools (Current / Monthly)\n` +
+      `• **Prompt Credits**: ${credits.availablePromptCredits} cr${credits.monthlyPromptCredits ? ` / ${credits.monthlyPromptCredits.toLocaleString()} cr` : ''}\n` +
+      `• **AI Credits**: ${credits.availableFlowCredits} cr${credits.monthlyFlowCredits ? ` / ${credits.monthlyFlowCredits.toLocaleString()} cr` : ''}\n\n` +
+      `---\n\n` +
+      `### 📊 All Model Quotas (Rate Limits)\n` +
+      `${modelQuotasLines}\n\n` +
+      `---\n\n` +
+      `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate) | *v${this.extensionVersion}*`
+    );
+    tooltip.isTrusted = true;
+    this.statusBarItem.tooltip = tooltip;
+    this.statusBarItem.show();
   }
 
   private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string): Promise<boolean> {
@@ -291,7 +579,7 @@ export class AutoResumer {
       const now = new Date().toLocaleString();
       appendToLogFile(
         'resumer-history.md',
-        `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | No active trajectories found to resume | Idle |\n`
+        `| \`${proc.pid}\` | \`${now}\` | **Resume Dispatched** | No active trajectories found to resume | Idle |\n`
       );
       return false;
     }
@@ -316,16 +604,38 @@ export class AutoResumer {
     }
 
     if (activeTrajectoryId) {
+      const pState = this.states.get(proc.pid);
+      if (pState) {
+        pState.currentState = 'DISPATCHING_RESUME';
+      }
+      this.currentOperationalState = 'DISPATCHING_RESUME';
+      if (this.statusBarItem) {
+        this.statusBarItem.text = `$(zap) AGY: Resuming Chat...`;
+        this.statusBarItem.backgroundColor = undefined;
+      }
+
+      this.log(`Pid ${proc.pid}: 🚀 DISPATCH: Sending continuation prompt "${promptText}" to trajectory ${activeTrajectoryId} using model ${modelId}`);
       this.activityChannel.appendLine(
-        `[AutoResumer] Resuming cascade ${activeTrajectoryId} with prompt "${promptText}" using model ${modelId}`
+        `[AutoResumer] 🚀 DISPATCH: Sending continuation prompt "${promptText}" to trajectory ${activeTrajectoryId} using model ${modelId}`
       );
       const success = await this.sendCascadeMessage(proc, activeTrajectoryId, modelId, promptText);
       const now = new Date().toLocaleString();
+
+      if (pState) {
+        pState.lastResumedInfo = {
+          timestamp: new Date().toLocaleTimeString(),
+          trajectoryId: activeTrajectoryId,
+          modelId,
+          prompt: promptText,
+          success,
+        };
+      }
+
       if (success) {
-        this.activityChannel.appendLine(`[AutoResumer] Successfully resumed cascade ${activeTrajectoryId}.`);
+        this.activityChannel.appendLine(`[AutoResumer] ✅ Successfully resumed cascade ${activeTrajectoryId}.`);
         appendToLogFile(
           'resumer-history.md',
-          `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | Resumed trajectory \`${activeTrajectoryId.substring(0, 8)}\` via model \`${modelId}\` | Success |\n`
+          `| \`${proc.pid}\` | \`${now}\` | **Resume Dispatched** | Sent prompt \`${promptText}\` to trajectory \`${activeTrajectoryId.substring(0, 8)}\` via model \`${modelId}\` | Success |\n`
         );
         const showNotifications = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showNotifications', true);
         if (showNotifications) {
@@ -340,10 +650,10 @@ export class AutoResumer {
         }
         return true;
       } else {
-        this.activityChannel.appendLine(`[AutoResumer] Failed to resume cascade ${activeTrajectoryId}.`);
+        this.activityChannel.appendLine(`[AutoResumer] ❌ Failed to resume cascade ${activeTrajectoryId}.`);
         appendToLogFile(
           'resumer-history.md',
-          `| \`${proc.pid}\` | \`${now}\` | **Cascade Resumed** | Failed to resume trajectory \`${activeTrajectoryId.substring(0, 8)}\` via model \`${modelId}\` | Failure |\n`
+          `| \`${proc.pid}\` | \`${now}\` | **Resume Dispatched** | Failed to send prompt \`${promptText}\` to trajectory \`${activeTrajectoryId.substring(0, 8)}\` via model \`${modelId}\` | Failure |\n`
         );
         return false;
       }
@@ -664,6 +974,56 @@ export function isCurrentWorkspaceProcess(proc: DetectedProcess, currentWorkspac
   const procNorm = normalizeWorkspaceString(proc.workspaceId);
   return currentNorm.includes(procNorm) || procNorm.includes(currentNorm);
 }
+
+export async function findTargetWorkspaceProcess(
+  discovered: DetectedProcess[],
+  currentWorkspaceFsPath?: string
+): Promise<DetectedProcess | undefined> {
+  const activeWithPorts = discovered.filter(p => p.ports && p.ports.length > 0);
+  if (activeWithPorts.length === 0) {
+    return undefined;
+  }
+
+  // 1. If only 1 language server process exists globally, bind to it
+  if (activeWithPorts.length === 1) {
+    return activeWithPorts[0];
+  }
+
+  if (!currentWorkspaceFsPath) {
+    // If no workspace folder is open, match global or process without workspaceId
+    return activeWithPorts.find(p => !p.workspaceId || p.workspaceId.toLowerCase() === 'global') || activeWithPorts[0];
+  }
+
+  // 2. Exact / substring Workspace string matching
+  const exactMatch = activeWithPorts.find(p => isCurrentWorkspaceProcess(p, currentWorkspaceFsPath));
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  // 3. File Descriptor / lsof inspection for candidate processes (e.g. hashed/opaque workspaceIds)
+  for (const proc of activeWithPorts) {
+    const hasFile = await hasProcessOpenFileInWorkspace(proc.pid, currentWorkspaceFsPath);
+    if (hasFile) {
+      return proc;
+    }
+  }
+
+  // 4. Elimination Fallback:
+  // If all other processes explicitly match different known workspaces (e.g. file_Users_arjan_personal_<other>),
+  // and there is an unassigned process with a hex/unmapped workspaceId, pick it.
+  const otherWorkspaces = activeWithPorts.filter(p => {
+    if (!p.workspaceId) return false;
+    return p.workspaceId.startsWith('file_') && !isCurrentWorkspaceProcess(p, currentWorkspaceFsPath);
+  });
+
+  const unassigned = activeWithPorts.filter(p => !otherWorkspaces.includes(p));
+  if (unassigned.length === 1) {
+    return unassigned[0];
+  }
+
+  return undefined;
+}
+
 
 export function readActiveTranscriptTail(transcriptPath: string, maxBytes: number = 65536): string | null {
   try {

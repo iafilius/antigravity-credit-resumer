@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { detectProcesses } from './process-detector';
 import { queryCreditStatusForProcess } from './credit-monitor';
-import { AutoResumer, isCurrentWorkspaceProcess } from './auto-resumer';
+import { AutoResumer, isCurrentWorkspaceProcess, findTargetWorkspaceProcess } from './auto-resumer';
 import { setFileLoggerOutputChannel, initializeHistoryReport, appendToLogFile, rotateDebugLog } from './file-logger';
 import { triggerDeveloperUpdate } from './developer-updater';
 
@@ -16,7 +16,7 @@ const cachedProcesses = new Map<number, any>();
 let tickCount = 0;
 
 export function activate(context: vscode.ExtensionContext) {
-  const version = context.extension?.packageJSON?.version || '0.7.3';
+  const version = context.extension?.packageJSON?.version || '0.7.4';
 
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');
@@ -116,11 +116,17 @@ function scheduleDebouncedTick() {
 
 let startupRetryTimer: NodeJS.Timeout | undefined;
 let startupRetryCount = 0;
+let reconnectRetryTimer: NodeJS.Timeout | undefined;
+let reconnectRetryCount = 0;
 
 export function deactivate() {
   if (startupRetryTimer) {
     clearTimeout(startupRetryTimer);
     startupRetryTimer = undefined;
+  }
+  if (reconnectRetryTimer) {
+    clearTimeout(reconnectRetryTimer);
+    reconnectRetryTimer = undefined;
   }
   if (eventDebounceTimer) {
     clearTimeout(eventDebounceTimer);
@@ -173,16 +179,29 @@ async function pollIntervalTick() {
   if (!autoResumer) return;
 
   try {
-    const currentWorkspaceFsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const currentWorkspaceFsPath = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+      ? vscode.workspace.workspaceFolders[0].uri.fsPath
+      : undefined;
 
-    // 1. Perform lightweight in-memory check to clean up dead cached processes
+    const intervalSeconds = vscode.workspace
+      .getConfiguration('antigravityCreditResumer')
+      .get<number>('checkIntervalSeconds', 60);
+    autoResumer.recordPoll(intervalSeconds);
+
+    // 1. Prune dead processes from cache
     const deadPids: number[] = [];
-    for (const [pid, proc] of cachedProcesses.entries()) {
+    for (const pid of cachedProcesses.keys()) {
+      let proc: any = null;
       try {
-        process.kill(pid, 0); // Standard POSIX check: returns true if running, throws if dead
-      } catch (e: any) {
-        if (e && e.code === 'ESRCH') {
+        process.kill(pid, 0); // Check if PID exists
+        proc = cachedProcesses.get(pid);
+      } catch (err: any) {
+        if (err.code === 'ESRCH') {
           deadPids.push(pid);
+          continue;
+        } else {
+          // PID exists but cannot signal (EPERM), retain cached process
+          proc = cachedProcesses.get(pid);
         }
       }
       if (!proc || !proc.ports || proc.ports.length === 0) {
@@ -194,7 +213,7 @@ async function pollIntervalTick() {
     }
 
     // 2. Check if we currently have a cached process for this window
-    let targetProcess = Array.from(cachedProcesses.values()).find(p => p.ports && p.ports.length > 0 && isCurrentWorkspaceProcess(p, currentWorkspaceFsPath));
+    let targetProcess = await findTargetWorkspaceProcess(Array.from(cachedProcesses.values()), currentWorkspaceFsPath);
 
     // 3. If target process is missing from cache or every 10th tick, perform a discovery shell scan (ps/lsof)
     if (!targetProcess || tickCount % 10 === 0) {
@@ -206,19 +225,16 @@ async function pollIntervalTick() {
           cachedProcesses.set(proc.pid, proc);
         }
       }
-      targetProcess = Array.from(cachedProcesses.values()).find(p => isCurrentWorkspaceProcess(p, currentWorkspaceFsPath)) || (discovered.length === 1 && discovered[0].ports.length > 0 ? discovered[0] : undefined);
+      targetProcess = await findTargetWorkspaceProcess(discovered, currentWorkspaceFsPath);
     }
 
     tickCount++;
 
     if (!targetProcess) {
       autoResumer.log(`No active Antigravity Language Server process found matching workspace: ${currentWorkspaceFsPath || 'global'}`);
-      if (statusBarItem) {
-        statusBarItem.text = '$(credit-card) AGY: Init';
-        statusBarItem.tooltip = `Antigravity Credit Auto-Resumer is initializing (workspace: ${currentWorkspaceFsPath || 'global'})`;
-      }
+      autoResumer.handleApiDark();
 
-      // Schedule rapid sub-second retry if we are below max retries (10 retries at 500ms interval on startup)
+      // Schedule rapid sub-second retry if we are below max retries on startup (10 retries at 500ms)
       if (startupRetryCount < 10) {
         startupRetryCount++;
         autoResumer.log(`Scheduling rapid startup retry ${startupRetryCount}/10 in 500ms...`);
@@ -227,25 +243,46 @@ async function pollIntervalTick() {
           startupRetryTimer = undefined;
           pollIntervalTick();
         }, 500);
+      } else if (reconnectRetryCount < 3) {
+        // Mid-session rapid reconnection retry (3 retries at 3000ms)
+        reconnectRetryCount++;
+        autoResumer.log(`Scheduling rapid reconnect retry ${reconnectRetryCount}/3 in 3000ms...`);
+        if (reconnectRetryTimer) clearTimeout(reconnectRetryTimer);
+        reconnectRetryTimer = setTimeout(() => {
+          reconnectRetryTimer = undefined;
+          pollIntervalTick();
+        }, 3000);
       }
       return;
     }
 
-    // Reset rapid retry count once process is successfully attached
+    // Reset rapid retry counts once process is successfully attached
     startupRetryCount = 0;
 
     autoResumer.log(`Processing PID ${targetProcess.pid} for current workspace (${targetProcess.workspaceId || 'global'})...`);
     const credits = await queryCreditStatusForProcess(targetProcess);
 
     if (credits) {
+      reconnectRetryCount = 0;
+      if (reconnectRetryTimer) {
+        clearTimeout(reconnectRetryTimer);
+        reconnectRetryTimer = undefined;
+      }
       await autoResumer.processTick(targetProcess, credits);
     } else {
-      autoResumer.log(`Failed to query credits for PID ${targetProcess.pid} on ports: ${targetProcess.ports.join(', ')}`);
+      autoResumer.log(`Failed to query credits for PID ${targetProcess.pid} on ports: ${targetProcess.ports.join(', ')}${autoResumer.isWaitingForRefill(targetProcess.pid) ? ' [REFILL WAIT]' : ''}`);
+      autoResumer.handleApiDark(targetProcess);
       // Evict failed process from cache so next tick performs rediscovery
       cachedProcesses.delete(targetProcess.pid);
-      if (statusBarItem && !statusBarItem.text.includes('cr (')) {
-        statusBarItem.text = '$(credit-card) AGY: Init';
-        statusBarItem.tooltip = `Antigravity Credit Auto-Resumer is initializing (workspace: ${currentWorkspaceFsPath || 'global'})`;
+
+      if (reconnectRetryCount < 3) {
+        reconnectRetryCount++;
+        autoResumer.log(`Scheduling rapid credit query retry ${reconnectRetryCount}/3 in 3000ms...`);
+        if (reconnectRetryTimer) clearTimeout(reconnectRetryTimer);
+        reconnectRetryTimer = setTimeout(() => {
+          reconnectRetryTimer = undefined;
+          pollIntervalTick();
+        }, 3000);
       }
     }
   } catch (err: any) {

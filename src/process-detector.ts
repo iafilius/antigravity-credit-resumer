@@ -274,3 +274,38 @@ export function parseProcessLine(line: string, isWindows: boolean): { pid: numbe
 
   return { pid, commandLine };
 }
+
+export function hasProcessOpenFileInWorkspace(pid: number, workspaceFsPath?: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!workspaceFsPath || !pid || pid <= 0) {
+      resolve(false);
+      return;
+    }
+
+    if (process.platform === 'win32') {
+      // Windows file handle inspection fallback
+      resolve(false);
+      return;
+    }
+
+    const normWorkspace = workspaceFsPath.replace(/[/\\]+$/, '');
+    exec(`lsof -p ${pid} -Fn 2>/dev/null`, { timeout: 1500 }, (err, stdout) => {
+      if (err || !stdout) {
+        resolve(false);
+        return;
+      }
+      const lines = stdout.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('n/')) {
+          const filePath = line.substring(1);
+          if (filePath.startsWith(normWorkspace) || filePath.includes(normWorkspace)) {
+            resolve(true);
+            return;
+          }
+        }
+      }
+      resolve(false);
+    });
+  });
+}
+
