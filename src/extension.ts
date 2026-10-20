@@ -268,7 +268,7 @@ async function pollIntervalTick() {
         clearTimeout(reconnectRetryTimer);
         reconnectRetryTimer = undefined;
       }
-      await autoResumer.processTick(targetProcess, credits);
+      await autoResumer.processTick(targetProcess, credits, currentWorkspaceFsPath);
     } else {
       autoResumer.log(`Failed to query credits for PID ${targetProcess.pid} on ports: ${targetProcess.ports.join(', ')}${autoResumer.isWaitingForRefill(targetProcess.pid) ? ' [REFILL WAIT]' : ''}`);
       autoResumer.handleApiDark(targetProcess);

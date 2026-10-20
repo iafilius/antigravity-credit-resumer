@@ -121,7 +121,7 @@ export class AutoResumer {
     return this.states.get(pid)?.waitingForRefill ?? false;
   }
 
-  public async processTick(proc: DetectedProcess, credits: UserCreditsStatus) {
+  public async processTick(proc: DetectedProcess, credits: UserCreditsStatus, currentWorkspaceFsPath?: string) {
     const config = vscode.workspace.getConfiguration('antigravityCreditResumer');
     const mode = config.get<string>('modelSelectionMode', 'stick');
     const resumePrompt = config.get<string>('resumePrompt', 'continue');
@@ -160,15 +160,15 @@ export class AutoResumer {
     const map = extractTrajectoryMap(rawTrajectories);
     const candidateEntries = Object.keys(map)
       .map(id => ({ id, traj: map[id] }))
-      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
+      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj, currentWorkspaceFsPath));
     candidateEntries.sort((a, b) => {
       const timeA = new Date(a.traj?.lastModifiedTime || 0).getTime();
       const timeB = new Date(b.traj?.lastModifiedTime || 0).getTime();
       return timeB - timeA;
     });
-    state.activeTrajectoryId = candidateEntries[0]?.id || findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId)?.id;
+    state.activeTrajectoryId = candidateEntries[0]?.id || findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId, undefined, currentWorkspaceFsPath)?.id;
 
-    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId, explicitConfigModelId);
+    const currentModelId = resolveActiveModelId(credits, state.lastModelQuotas, state.lastSelectedModel, rawTrajectories, proc.workspaceId, explicitConfigModelId, undefined, currentWorkspaceFsPath);
     if (!currentModelId) {
       // Cannot resolve model yet — still update status bar with credit counts so it doesn't stay stuck on 'Init'
       if (this.statusBarItem) {
@@ -315,7 +315,7 @@ export class AutoResumer {
               }
             });
           }
-          const success = await this.resumeActiveCascade(proc, alternateModel.model, resumePrompt);
+          const success = await this.resumeActiveCascade(proc, alternateModel.model, resumePrompt, currentWorkspaceFsPath);
           if (success) {
             state.waitingForRefill = false;
             state.modelExhausted = false;
@@ -404,7 +404,7 @@ export class AutoResumer {
           this.statusBarItem.backgroundColor = undefined;
         }
 
-        const success = await this.resumeActiveCascade(proc, currentModelId, resumePrompt);
+        const success = await this.resumeActiveCascade(proc, currentModelId, resumePrompt, currentWorkspaceFsPath);
         if (success) {
           state.waitingForRefill = false;
           state.currentState = 'DOWNCOUNTING';
@@ -549,7 +549,7 @@ export class AutoResumer {
     this.statusBarItem.show();
   }
 
-  private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string): Promise<boolean> {
+  private async resumeActiveCascade(proc: DetectedProcess, modelId: string, promptText: string, currentWorkspaceFsPath?: string): Promise<boolean> {
     this.activityChannel.appendLine(`[AutoResumer] Attempting to resume active cascade for process PID ${proc.pid} using model ${modelId}...`);
 
     const rawTrajectories = await this.getAllTrajectories(proc);
@@ -559,12 +559,12 @@ export class AutoResumer {
     // Filter trajectories by workspace
     let candidateEntries = allIds
       .map(id => ({ id, traj: map[id] }))
-      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj));
+      .filter(({ traj }) => matchesWorkspace(proc.workspaceId, traj, currentWorkspaceFsPath));
 
     this.log(`Pid ${proc.pid}: Found ${allIds.length} total trajectories from RPC, ${candidateEntries.length} matched workspace (${proc.workspaceId || 'global'}).`);
 
     if (candidateEntries.length === 0) {
-      const diskTraj = findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId);
+      const diskTraj = findLatestWorkspaceTrajectoryOnDisk(proc.workspaceId, undefined, currentWorkspaceFsPath);
       if (diskTraj) {
         this.log(`Pid ${proc.pid}: Discovered active workspace trajectory on disk: ${diskTraj.id}`);
         candidateEntries = [{ id: diskTraj.id, traj: { trajectoryId: diskTraj.id, lastModifiedTime: new Date(diskTraj.mtime).toISOString() } }];
@@ -870,7 +870,11 @@ export interface DiskTrajectoryInfo {
   transcriptPath: string;
 }
 
-export function findLatestWorkspaceTrajectoryOnDisk(workspaceId?: string, customHomeDir?: string): DiskTrajectoryInfo | null {
+export function findLatestWorkspaceTrajectoryOnDisk(
+  workspaceId?: string,
+  customHomeDir?: string,
+  workspaceFsPath?: string
+): DiskTrajectoryInfo | null {
   try {
     const brainDir = path.join(customHomeDir || os.homedir(), '.gemini', 'antigravity-ide', 'brain');
     if (!fs.existsSync(brainDir)) return null;
@@ -900,23 +904,27 @@ export function findLatestWorkspaceTrajectoryOnDisk(workspaceId?: string, custom
     candidates.sort((a, b) => b.mtime - a.mtime);
 
     const procNorm = normalizeWorkspaceString(workspaceId || '');
+    const fsPathNorm = normalizeWorkspaceString(workspaceFsPath || '');
 
     for (const candidate of candidates.slice(0, 30)) {
       try {
-        if (!procNorm || procNorm === 'global') {
+        if ((!procNorm || procNorm === 'global') && !fsPathNorm) {
           return candidate;
         }
 
-        // Fast check: Read up to 8KB from the head of the file to inspect workspace metadata in step 0
+        // Fast check: Read up to 16KB from the head of the file to inspect workspace metadata in step 0
         const fd = fs.openSync(candidate.transcriptPath, 'r');
-        const buffer = Buffer.alloc(8192);
-        const bytesRead = fs.readSync(fd, buffer, 0, 8192, 0);
+        const buffer = Buffer.alloc(16384);
+        const bytesRead = fs.readSync(fd, buffer, 0, 16384, 0);
         fs.closeSync(fd);
 
         if (bytesRead > 0) {
           const headText = buffer.toString('utf-8', 0, bytesRead);
           const headNorm = normalizeWorkspaceString(headText);
-          if (headNorm.includes(procNorm) || procNorm.includes(headNorm)) {
+          if (procNorm && procNorm !== 'global' && (headNorm.includes(procNorm) || procNorm.includes(headNorm))) {
+            return candidate;
+          }
+          if (fsPathNorm && (headNorm.includes(fsPathNorm) || fsPathNorm.includes(headNorm))) {
             return candidate;
           }
         }
@@ -943,11 +951,12 @@ export function normalizeWorkspaceString(str: string): string {
     .replace(/[^a-z0-9]/g, '');
 }
 
-export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any): boolean {
-  if (!procWorkspaceId) return true; // Global process or no workspace context
+export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any, workspaceFsPath?: string): boolean {
+  if (!procWorkspaceId && !workspaceFsPath) return true; // Global process or no workspace context
 
-  const procNorm = normalizeWorkspaceString(procWorkspaceId);
-  if (!procNorm) return true;
+  const procNorm = normalizeWorkspaceString(procWorkspaceId || '');
+  const fsPathNorm = normalizeWorkspaceString(workspaceFsPath || '');
+  if (!procNorm && !fsPathNorm) return true;
 
   const workspaceObjects = traj?.workspaces || [];
   const metadataUris = traj?.trajectoryMetadata?.workspaceUris || [];
@@ -960,7 +969,9 @@ export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any)
 
   return uris.some((u) => {
     const uriNorm = normalizeWorkspaceString(u);
-    return uriNorm.includes(procNorm) || procNorm.includes(uriNorm);
+    if (procNorm && (uriNorm.includes(procNorm) || procNorm.includes(uriNorm))) return true;
+    if (fsPathNorm && (uriNorm.includes(fsPathNorm) || fsPathNorm.includes(uriNorm))) return true;
+    return false;
   });
 }
 
@@ -1147,6 +1158,51 @@ export function mapModelLabelToModelId(label: string, models: ModelQuotaInfo[] =
   return null;
 }
 
+export function selectDeterministicDefaultModel(credits: UserCreditsStatus): string {
+  if (!credits.models || credits.models.length === 0) return '';
+
+  // 1. If language server provided an explicit non-placeholder default, respect it
+  const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
+  if (staticDefault && !staticDefault.startsWith('MODEL_PLACEHOLDER_')) {
+    const matching = credits.models.find(m => m.model === staticDefault || m.modelId === staticDefault);
+    if (matching?.model) return matching.model;
+    return staticDefault;
+  }
+
+  // 2. Prioritize standard Antigravity IDE default: Gemini Flash (Medium)
+  const flashMedium = credits.models.find(m => {
+    const l = (m.label || '').toLowerCase();
+    const id = (m.modelId || '').toLowerCase();
+    return (l.includes('flash') || id.includes('flash')) && (l.includes('medium') || l.includes('(medium)') || id.includes('medium'));
+  });
+  if (flashMedium?.model) return flashMedium.model;
+
+  // 3. Gemini Flash (High)
+  const flashHigh = credits.models.find(m => {
+    const l = (m.label || '').toLowerCase();
+    const id = (m.modelId || '').toLowerCase();
+    return (l.includes('flash') || id.includes('flash')) && (l.includes('high') || l.includes('(high)') || id.includes('high'));
+  });
+  if (flashHigh?.model) return flashHigh.model;
+
+  // 4. Any Gemini Flash
+  const anyFlash = credits.models.find(m => {
+    const l = (m.label || '').toLowerCase();
+    const id = (m.modelId || '').toLowerCase();
+    return l.includes('flash') || id.includes('flash');
+  });
+  if (anyFlash?.model) return anyFlash.model;
+
+  // 5. If staticDefault was a placeholder and matches an existing model in credits.models
+  if (staticDefault) {
+    const matching = credits.models.find(m => m.model === staticDefault || m.modelId === staticDefault);
+    if (matching?.model) return matching.model;
+  }
+
+  // 6. Absolute fallback: first available model
+  return credits.models[0]?.model || '';
+}
+
 export function resolveActiveModelId(
   credits: UserCreditsStatus,
   lastModelQuotas?: Map<string, number>,
@@ -1154,7 +1210,8 @@ export function resolveActiveModelId(
   rawTrajectories?: any,
   workspaceId?: string,
   explicitConfigModelId?: string,
-  customHomeDir?: string
+  customHomeDir?: string,
+  workspaceFsPath?: string
 ): string {
   // 1. Explicit VS Code Configuration (Highest Priority - Global UI Selection)
   if (explicitConfigModelId) {
@@ -1163,7 +1220,7 @@ export function resolveActiveModelId(
 
   // 2. Active Transcript Tail (<USER_SETTINGS_CHANGE> tag from latest chat session)
   try {
-    const diskTraj = findLatestWorkspaceTrajectoryOnDisk(workspaceId, customHomeDir);
+    const diskTraj = findLatestWorkspaceTrajectoryOnDisk(workspaceId, customHomeDir, workspaceFsPath);
     if (diskTraj?.transcriptPath) {
       const content = readActiveTranscriptTail(diskTraj.transcriptPath);
       if (content) {
@@ -1195,18 +1252,8 @@ export function resolveActiveModelId(
     }
   }
 
-  // 5. Global Default Override from Language Server API
-  const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
-  if (staticDefault && !staticDefault.startsWith('MODEL_PLACEHOLDER_')) {
-    return staticDefault;
-  }
-
-  // 6. Fallback: pick the first model from the available list
-  if (credits.models.length > 0 && credits.models[0].model) {
-    return credits.models[0].model;
-  }
-
-  return '';
+  // 5. Deterministic Default Selection from Language Server Models
+  return selectDeterministicDefaultModel(credits);
 }
 
 

@@ -4,6 +4,12 @@ All notable changes to the Antigravity Credit Auto-Resumer extension are documen
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.9] — 2026-10-20
+
+### Fixed
+- **Multi-Root & `.code-workspace` Trajectory Discovery**: Enabled `findLatestWorkspaceTrajectoryOnDisk` to inspect transcript headers against `currentWorkspaceFsPath`. Resolves `.code-workspace` windows where the language server process uses an opaque SHA256 hex `--workspace_id`, ensuring active chat transcripts and manual model selections on disk are accurately discovered rather than falling back.
+- **Deterministic Cold-Start Model Fallback**: Replaced non-deterministic fallback to arbitrary array index `credits.models[0]` with `selectDeterministicDefaultModel()`. When no prior transcript turn or quota delta exists, the resumer deterministically prioritizes standard IDE defaults (`Gemini 3.8 Flash (Medium)` > `Gemini 3.8 Flash (High)` > other Flash > configuration override > first model), preventing spurious startup locks onto unexpected models such as Claude Opus 5.5 or Gemini Flash High.
+
 ## [0.7.8] — 2026-09-21
 
 ### Fixed
