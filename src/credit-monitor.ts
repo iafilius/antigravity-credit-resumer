@@ -1,5 +1,4 @@
-import * as https from 'https';
-import { DetectedProcess } from './process-detector';
+import { DetectedProcess, postConnectRpc } from './process-detector';
 
 export interface ModelQuotaInfo {
   label: string;
@@ -41,63 +40,31 @@ export function queryCreditStatusForProcess(proc: DetectedProcess): Promise<User
   });
 }
 
-function queryGetUserStatus(port: number, csrfToken: string): Promise<any | null> {
-  return new Promise((resolve) => {
-    const payload = JSON.stringify({
-      metadata: {
-        ideName: 'antigravity',
-        extensionName: 'antigravity',
-        locale: 'en',
-      },
-    });
-
-    const options: https.RequestOptions = {
-      hostname: '127.0.0.1',
-      port: port,
-      path: '/exa.language_server_pb.LanguageServerService/GetUserStatus',
-      method: 'POST',
-      rejectUnauthorized: false, // Local self-signed certificates
-      headers: {
-        'Content-Type': 'application/json',
-        'Connect-Protocol-Version': '1',
-        'X-Codeium-Csrf-Token': csrfToken,
-        'Content-Length': Buffer.byteLength(payload),
-      },
-      timeout: 2000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed);
-          } catch (e) {
-            resolve(null);
-          }
-        } else {
-          resolve(null);
-        }
-      });
-    });
-
-    req.on('error', () => {
-      resolve(null);
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(null);
-    });
-
-    req.write(payload);
-    req.end();
+async function queryGetUserStatus(port: number, csrfToken: string): Promise<any | null> {
+  const payload = JSON.stringify({
+    metadata: {
+      ideName: 'antigravity',
+      extensionName: 'antigravity',
+      locale: 'en',
+    },
   });
+
+  const res = await postConnectRpc(
+    port,
+    csrfToken,
+    '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+    payload,
+    2000
+  );
+
+  if (res && res.statusCode === 200 && res.body) {
+    try {
+      return JSON.parse(res.body);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function parseModelQuotas(status: any): ModelQuotaInfo[] {
@@ -127,4 +94,3 @@ function parseModelQuotas(status: any): ModelQuotaInfo[] {
 
   return models;
 }
-

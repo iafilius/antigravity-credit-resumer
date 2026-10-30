@@ -4,6 +4,18 @@ All notable changes to the Antigravity Credit Auto-Resumer extension are documen
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.0] — 2026-10-30
+
+### Added
+- **In-Process `google.google-antigravity` Extension Bridge (Tier 1 Discovery)**: Reads the window's active `csrfToken` and hub `port` directly from `vscode.extensions.getExtension('google.google-antigravity')?.exports` in 0ms without spawning OS subprocesses, with seamless fallback to Tier 2 OS process discovery.
+- **Antigravity IDE 2.0 (`agy --hub`) Process & Multi-Root Support**: Updated `parseProcessLine` and `parseCandidateFromCommandLine` in `src/process-detector.ts` to detect both `agy --hub` (`v1.4.10+`) and legacy `language_server` processes, supporting `--key=value` and `--key value` CLI flag formats (`--csrf_token`, `--hub-port`, `--extension_server_port`, `--workspace_id`, and multiple `--add-dir` flags stored in `workspacePaths`).
+- **Dual-Protocol Connect-RPC Transport (`postConnectRpc`)**: Added automatic HTTPS-to-HTTP fallback so Connect-RPC requests (`GetUserStatus`, `GetAllCascadeTrajectories`, `SendUserCascadeMessage`) succeed seamlessly on both HTTPS ephemeral ports and plain HTTP `--hub-port` endpoints.
+- **Antigravity 2.0 Brain Directory & Gemini 4 Argon Support**: Added `~/.gemini/antigravity/brain` alongside `~/.gemini/antigravity-ide/brain` for on-disk transcript discovery, added `Gemini 4 Argon (High/Medium/Low)` short label formatting (`4 Argon-H`/`-M`/`-L`), and updated `selectDeterministicDefaultModel()` to respect valid `defaultOverrideModelConfig` entries.
+
+### Fixed
+- **Official `SendUserCascadeMessageRequest` Protobuf Schema & `cascadeId` Resolution**: Updated `sendCascadeMessage` in `src/auto-resumer.ts` to send the official Protobuf JSON schema (`cascadeId`, `items: [{ text }]`, `cascadeConfig: { plannerConfig: { planModel } }`, `metadata`) with automatic fallback to the legacy payload on HTTP 400, and prioritized the `trajectorySummaries` map key (`cascadeId` / `rootConversationId`) over internal `traj.trajectoryId` (which caused HTTP 404 on `agy --hub`).
+- **Configuration Listener Key**: Fixed `onDidChangeConfiguration` listener in `src/extension.ts` to watch `antigravityCreditResumer.checkInterval` instead of `checkIntervalSeconds`.
+
 ## [0.7.9] — 2026-10-20
 
 ### Fixed

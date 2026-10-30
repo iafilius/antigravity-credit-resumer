@@ -23,7 +23,7 @@ build: install
 	npm run compile
 
 package: build
-	npx vsce package
+	npx vsce package --allow-star-activation --no-dependencies
 
 publish:
 	@if [ -z "$(TOKEN)" ]; then \

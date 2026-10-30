@@ -43,8 +43,9 @@ graph TD
 
 Before any request is sent, the extension must locate the running Antigravity server and its dynamic communication ports.
 
-* **Command Scanning**: In [process-detector.ts](../src/process-detector.ts), the `detectProcesses` function runs a dynamic OS process check (`ps -ax` on macOS/Linux or `wmic` on Windows) to search for command lines with `language_server` and `--csrf_token`.
-* **Port Resolution**: In `resolvePortsForPid`, the tool scans listening TCP ports associated with the language server PID (`lsof -nP -iTCP -sTCP:LISTEN -p <pid>` on macOS or `netstat -ano` on Windows).
+* **Tier 1 — In-Process Extension Bridge**: In [extension.ts](../src/extension.ts), `resolveWindowProcessFromAgyExtension()` inspects `vscode.extensions.getExtension('google.google-antigravity')?.exports` (`{ csrfToken, port }`) to immediately bind the current window's `agy --hub` instance without spawning OS shell commands.
+* **Tier 2 — OS Command Scanning**: In [process-detector.ts](../src/process-detector.ts), `detectProcesses()` runs a dynamic OS process check (`ps -ax` on macOS/Linux or `wmic` on Windows) to search for command lines with `agy` (`--hub`) or `language_server` and `--csrf_token` (supporting both `--key=value` and `--key value` syntax, `--hub-port`, `--workspace_id`, and multiple `--add-dir` workspace roots).
+* **Port & Protocol Resolution**: `postConnectRpc()` supports both HTTPS (self-signed TLS) and plain HTTP (`--hub-port` on `127.0.0.1`), automatically falling back from HTTPS to HTTP on TLS/socket error.
 * **Caching**: Process information (PID, CSRF token, resolved ports) is cached in-memory in [extension.ts](../src/extension.ts). The extension performs a fast verification tick and only spawns process scanning shell commands if the cache is empty or every fourth tick to minimize CPU overhead.
 * **Survival Sweeps**: Cached processes are only evicted if `process.kill(pid, 0)` returns `ESRCH` (process not found). `EPERM` errors from permission-restricted processes do **not** trigger eviction.
 
@@ -74,14 +75,18 @@ To resume the correct conversation, the system must identify the conversation th
 
 When the resumer decides to continue the session (either because the quota refilled or an alternative model was selected):
 
-* **Endpoint**: HTTPS POST to `/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage`
+* **Endpoint**: HTTPS/HTTP POST to `/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage`
 * **Payload Structure**:
   ```json
   {
-    "message": "continue",
-    "selectedCascadeId": "<active-trajectory-id>",
-    "requestedModel": {
-      "model": "<selected-model-id>"
+    "cascadeId": "<active-cascade-id>",
+    "items": [
+      { "text": "continue" }
+    ],
+    "cascadeConfig": {
+      "plannerConfig": {
+        "planModel": "<selected-model-id>"
+      }
     },
     "metadata": {
       "ideName": "antigravity",
@@ -90,6 +95,7 @@ When the resumer decides to continue the session (either because the quota refil
     }
   }
   ```
+  *(Automatically falls back to the legacy `{ message, selectedCascadeId, requestedModel, metadata }` payload if an older server returns HTTP 400.)*
 * **Status Updates & Logs**: Upon successful resumption, toast notifications are displayed and the resumption is logged to both the `Antigravity Credit Resumer Activity` output channel and the persistent history file.
 
 ---

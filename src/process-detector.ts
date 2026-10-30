@@ -1,5 +1,6 @@
 import { exec } from 'child_process';
 import * as https from 'https';
+import * as http from 'http';
 
 export interface DetectedProcess {
   pid: number;
@@ -7,6 +8,7 @@ export interface DetectedProcess {
   extensionServerPort: number;
   extensionServerCsrfToken: string;
   workspaceId?: string;
+  workspacePaths?: string[];
   ports: number[];
 }
 
@@ -76,11 +78,57 @@ export function getListeningPortsByPid(isWindows: boolean = process.platform ===
   });
 }
 
+export function parseCandidateFromCommandLine(pid: number, commandLine: string): {
+  pid: number;
+  csrfToken: string;
+  extensionServerPort: number;
+  extensionServerCsrfToken: string;
+  workspaceId?: string;
+  workspacePaths?: string[];
+  hubPort?: number;
+} | null {
+  const csrfTokenMatch = commandLine.match(/--csrf_token(?:=|\s+)([^\s"']+)/);
+  if (!csrfTokenMatch) {
+    return null;
+  }
+
+  const extPortMatch = commandLine.match(/--extension_server_port(?:=|\s+)(\d+)/);
+  const hubPortMatch = commandLine.match(/--hub-port(?:=|\s+)(\d+)/);
+  const extCsrfMatch = commandLine.match(/--extension_server_csrf_token(?:=|\s+)([^\s"']+)/);
+  const workspaceIdMatch = commandLine.match(/--workspace_id(?:=|\s+)([^\s"']+)/);
+
+  const workspacePaths: string[] = [];
+  const addDirRegex = /--add-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))/g;
+  let addDirMatch: RegExpExecArray | null;
+  while ((addDirMatch = addDirRegex.exec(commandLine)) !== null) {
+    const rawDir = (addDirMatch[1] || addDirMatch[2] || addDirMatch[3] || '').trim();
+    if (rawDir && !workspacePaths.includes(rawDir)) {
+      workspacePaths.push(rawDir);
+    }
+  }
+
+  const hubPort = hubPortMatch ? parseInt(hubPortMatch[1], 10) : undefined;
+  const extPort = extPortMatch ? parseInt(extPortMatch[1], 10) : (hubPort || 0);
+  const workspaceId = workspaceIdMatch
+    ? workspaceIdMatch[1]
+    : (workspacePaths.length > 0 ? workspacePaths[0] : undefined);
+
+  return {
+    pid,
+    csrfToken: csrfTokenMatch[1],
+    extensionServerPort: extPort,
+    extensionServerCsrfToken: extCsrfMatch ? extCsrfMatch[1] : '',
+    workspaceId,
+    workspacePaths: workspacePaths.length > 0 ? workspacePaths : undefined,
+    hubPort,
+  };
+}
+
 export function detectProcesses(): Promise<DetectedProcess[]> {
   return new Promise((resolve) => {
     const isWindows = process.platform === 'win32';
     const cmd = isWindows
-      ? 'wmic process where "name like \'language_server%\'" get ProcessId, CommandLine'
+      ? 'wmic process where "name like \'language_server%\' or name like \'agy%\'" get ProcessId, CommandLine'
       : 'ps -ax -o pid,command';
 
     exec(cmd, async (error, stdout) => {
@@ -89,14 +137,7 @@ export function detectProcesses(): Promise<DetectedProcess[]> {
         return;
       }
 
-      const candidateList: {
-        pid: number;
-        csrfToken: string;
-        extensionServerPort: number;
-        extensionServerCsrfToken: string;
-        workspaceId?: string;
-      }[] = [];
-
+      const candidateList: NonNullable<ReturnType<typeof parseCandidateFromCommandLine>>[] = [];
       const lines = stdout.split('\n');
 
       for (const line of lines) {
@@ -105,21 +146,9 @@ export function detectProcesses(): Promise<DetectedProcess[]> {
           continue;
         }
 
-        const { pid, commandLine } = parsed;
-
-        const csrfTokenMatch = commandLine.match(/--csrf_token\s+([^\s]+)/);
-        const extPortMatch = commandLine.match(/--extension_server_port\s+(\d+)/);
-        const extCsrfMatch = commandLine.match(/--extension_server_csrf_token\s+([^\s]+)/);
-        const workspaceIdMatch = commandLine.match(/--workspace_id\s+([^\s]+)/);
-
-        if (csrfTokenMatch) {
-          candidateList.push({
-            pid,
-            csrfToken: csrfTokenMatch[1],
-            extensionServerPort: extPortMatch ? parseInt(extPortMatch[1], 10) : 0,
-            extensionServerCsrfToken: extCsrfMatch ? extCsrfMatch[1] : '',
-            workspaceId: workspaceIdMatch ? workspaceIdMatch[1] : undefined,
-          });
+        const candidate = parseCandidateFromCommandLine(parsed.pid, parsed.commandLine);
+        if (candidate) {
+          candidateList.push(candidate);
         }
       }
 
@@ -133,13 +162,18 @@ export function detectProcesses(): Promise<DetectedProcess[]> {
 
       const processes = await Promise.all(
         candidateList.map(async (candidate) => {
-          let ports = osPortMap.get(candidate.pid) || [];
+          const osPorts = osPortMap.get(candidate.pid) || [];
+          let ports = [...osPorts];
+          if (candidate.hubPort && candidate.hubPort > 0 && !ports.includes(candidate.hubPort)) {
+            ports.unshift(candidate.hubPort);
+          }
           if (ports.length === 0) {
             // Graceful fallback to pure Node candidate probing if OS lookup yielded no ports
             ports = await resolvePortsForCandidate(candidate.extensionServerPort, candidate.csrfToken);
           }
+          const { hubPort: _hubPort, ...rest } = candidate;
           return {
-            ...candidate,
+            ...rest,
             ports,
           };
         })
@@ -157,14 +191,20 @@ export async function resolvePortsForCandidate(extensionServerPort: number, csrf
 
   const base = extensionServerPort;
 
-  // Tier 1: Most immediate adjacent offsets (+1 to +10, and -5 to 0)
+  // Tier 0: Direct base port check (e.g. when --hub-port IS the Connect-RPC port)
+  const directHit = await probeHttpsPort(base, csrfToken);
+  if (directHit !== null) {
+    return [directHit];
+  }
+
+  // Tier 1: Most immediate adjacent offsets (+1 to +10, and -5 to -1)
   const tier1: number[] = [];
   for (let offset = 1; offset <= 10; offset++) {
     tier1.push(base + offset);
   }
-  for (let offset = -5; offset <= 0; offset++) {
+  for (let offset = -5; offset <= -1; offset++) {
     const p = base + offset;
-    if (p > 0 && p !== base) {
+    if (p > 0) {
       tier1.push(p);
     }
   }
@@ -192,20 +232,18 @@ export async function resolvePortsForCandidate(extensionServerPort: number, csrf
   return [];
 }
 
-export function probeHttpsPort(port: number, csrfToken: string): Promise<number | null> {
+export function postConnectRpc(
+  port: number,
+  csrfToken: string,
+  rpcPath: string,
+  payload: string,
+  timeoutMs: number = 2000
+): Promise<{ statusCode: number; body: string } | null> {
   return new Promise((resolve) => {
-    const payload = JSON.stringify({
-      metadata: {
-        ideName: 'antigravity',
-        extensionName: 'antigravity',
-        locale: 'en',
-      },
-    });
-
-    const req = https.request({
+    const requestOptions: https.RequestOptions = {
       hostname: '127.0.0.1',
       port,
-      path: '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+      path: rpcPath,
       method: 'POST',
       rejectUnauthorized: false,
       agent: false,
@@ -215,23 +253,55 @@ export function probeHttpsPort(port: number, csrfToken: string): Promise<number 
         'X-Codeium-Csrf-Token': csrfToken,
         'Content-Length': Buffer.byteLength(payload),
       },
-      timeout: 250,
-    }, (res) => {
+      timeout: timeoutMs,
+    };
+
+    const tryHttpFallback = () => {
+      try {
+        const httpReq = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: rpcPath,
+            method: 'POST',
+            agent: false,
+            headers: requestOptions.headers,
+            timeout: timeoutMs,
+          },
+          (res) => {
+            let data = '';
+            res.on('data', (c) => {
+              data += c;
+            });
+            res.on('end', () => {
+              resolve({ statusCode: res.statusCode || 0, body: data });
+            });
+          }
+        );
+        httpReq.on('error', () => resolve(null));
+        httpReq.on('timeout', () => {
+          httpReq.destroy();
+          resolve(null);
+        });
+        httpReq.write(payload);
+        httpReq.end();
+      } catch {
+        resolve(null);
+      }
+    };
+
+    const req = https.request(requestOptions, (res) => {
       let data = '';
       res.on('data', (c) => {
         data += c;
       });
       res.on('end', () => {
-        if (res.statusCode === 200) {
-          resolve(port);
-        } else {
-          resolve(null);
-        }
+        resolve({ statusCode: res.statusCode || 0, body: data });
       });
     });
 
     req.on('error', () => {
-      resolve(null);
+      tryHttpFallback();
     });
 
     req.on('timeout', () => {
@@ -244,8 +314,36 @@ export function probeHttpsPort(port: number, csrfToken: string): Promise<number 
   });
 }
 
+export async function probeHttpsPort(port: number, csrfToken: string): Promise<number | null> {
+  const payload = JSON.stringify({
+    metadata: {
+      ideName: 'antigravity',
+      extensionName: 'antigravity',
+      locale: 'en',
+    },
+  });
+
+  const res = await postConnectRpc(
+    port,
+    csrfToken,
+    '/exa.language_server_pb.LanguageServerService/GetUserStatus',
+    payload,
+    250
+  );
+  if (res && res.statusCode === 200) {
+    return port;
+  }
+  return null;
+}
+
 export function parseProcessLine(line: string, isWindows: boolean): { pid: number; commandLine: string } | null {
-  if (!line.includes('language_server') || !line.includes('--csrf_token')) {
+  if (!line.includes('--csrf_token')) {
+    return null;
+  }
+
+  const isLegacyLanguageServer = line.includes('language_server');
+  const isAgyHub = line.includes('--hub') || /(?:^|[/\\]|\s)agy(?:\.exe)?(?:\s|$)/i.test(line);
+  if (!isLegacyLanguageServer && !isAgyHub) {
     return null;
   }
 
@@ -308,4 +406,3 @@ export function hasProcessOpenFileInWorkspace(pid: number, workspaceFsPath?: str
     });
   });
 }
-

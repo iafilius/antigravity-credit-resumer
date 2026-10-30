@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { detectProcesses } from './process-detector';
+import { detectProcesses, DetectedProcess } from './process-detector';
 import { queryCreditStatusForProcess } from './credit-monitor';
 import { AutoResumer, isCurrentWorkspaceProcess, findTargetWorkspaceProcess } from './auto-resumer';
 import { setFileLoggerOutputChannel, initializeHistoryReport, appendToLogFile, rotateDebugLog } from './file-logger';
@@ -12,11 +12,57 @@ let autoResumer: AutoResumer | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 
 // In-memory cache to store discovered language server processes and resolved ports
-const cachedProcesses = new Map<number, any>();
+const cachedProcesses = new Map<number, DetectedProcess>();
 let tickCount = 0;
 
+export async function resolveWindowProcessFromAgyExtension(currentWorkspaceFsPath?: string): Promise<DetectedProcess | undefined> {
+  try {
+    const extIds = ['google.google-antigravity', 'google.antigravity'];
+    for (const id of extIds) {
+      const ext = vscode.extensions?.getExtension?.(id);
+      if (!ext) continue;
+
+      const exportsObj: any = ext.isActive ? ext.exports : await ext.activate();
+      if (!exportsObj) continue;
+
+      const csrfToken: string | undefined = exportsObj.csrfToken || exportsObj.client?.csrfToken;
+      let port: number | undefined = typeof exportsObj.port === 'number' ? exportsObj.port : exportsObj.client?.port;
+
+      if (!port && typeof exportsObj.client?.serverUrl === 'string') {
+        const m = exportsObj.client.serverUrl.match(/:(\d+)\/?$/);
+        if (m) {
+          port = parseInt(m[1], 10);
+        }
+      }
+
+      if (csrfToken && port && port > 0) {
+        const workspacePaths = (vscode.workspace.workspaceFolders || []).map(f => f.uri.fsPath);
+        let matchedPid = process.pid;
+        for (const cached of cachedProcesses.values()) {
+          if (cached.csrfToken === csrfToken || (cached.ports && cached.ports.includes(port))) {
+            matchedPid = cached.pid;
+            break;
+          }
+        }
+        return {
+          pid: matchedPid,
+          csrfToken,
+          extensionServerPort: port,
+          extensionServerCsrfToken: csrfToken,
+          workspaceId: currentWorkspaceFsPath || 'global',
+          workspacePaths: workspacePaths.length > 0 ? workspacePaths : undefined,
+          ports: [port],
+        };
+      }
+    }
+  } catch {
+    // Fall back to OS process discovery if built-in extension API is unavailable
+  }
+  return undefined;
+}
+
 export function activate(context: vscode.ExtensionContext) {
-  const version = context.extension?.packageJSON?.version || '0.7.4';
+  const version = context.extension?.packageJSON?.version || '0.8.0';
 
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');
@@ -185,47 +231,53 @@ async function pollIntervalTick() {
 
     const intervalSeconds = vscode.workspace
       .getConfiguration('antigravityCreditResumer')
-      .get<number>('checkIntervalSeconds', 60);
+      .get<number>('checkInterval', 60);
     autoResumer.recordPoll(intervalSeconds);
 
-    // 1. Prune dead processes from cache
-    const deadPids: number[] = [];
-    for (const pid of cachedProcesses.keys()) {
-      let proc: any = null;
-      try {
-        process.kill(pid, 0); // Check if PID exists
-        proc = cachedProcesses.get(pid);
-      } catch (err: any) {
-        if (err.code === 'ESRCH') {
-          deadPids.push(pid);
-          continue;
-        } else {
-          // PID exists but cannot signal (EPERM), retain cached process
+    // Tier 1: Direct in-process extension bridge from built-in `google.google-antigravity`
+    let targetProcess = await resolveWindowProcessFromAgyExtension(currentWorkspaceFsPath);
+
+    // Tier 2: OS Process & Port Discovery fallback
+    if (!targetProcess) {
+      // 1. Prune dead processes from cache
+      const deadPids: number[] = [];
+      for (const pid of cachedProcesses.keys()) {
+        let proc: DetectedProcess | undefined;
+        try {
+          process.kill(pid, 0); // Check if PID exists
           proc = cachedProcesses.get(pid);
+        } catch (err: any) {
+          if (err.code === 'ESRCH') {
+            deadPids.push(pid);
+            continue;
+          } else {
+            // PID exists but cannot signal (EPERM), retain cached process
+            proc = cachedProcesses.get(pid);
+          }
+        }
+        if (!proc || !proc.ports || proc.ports.length === 0) {
+          deadPids.push(pid);
         }
       }
-      if (!proc || !proc.ports || proc.ports.length === 0) {
-        deadPids.push(pid);
+      for (const pid of deadPids) {
+        cachedProcesses.delete(pid);
       }
-    }
-    for (const pid of deadPids) {
-      cachedProcesses.delete(pid);
-    }
 
-    // 2. Check if we currently have a cached process for this window
-    let targetProcess = await findTargetWorkspaceProcess(Array.from(cachedProcesses.values()), currentWorkspaceFsPath);
+      // 2. Check if we currently have a cached process for this window
+      targetProcess = await findTargetWorkspaceProcess(Array.from(cachedProcesses.values()), currentWorkspaceFsPath);
 
-    // 3. If target process is missing from cache or every 10th tick, perform a discovery shell scan (ps/lsof)
-    if (!targetProcess || tickCount % 10 === 0) {
-      autoResumer.log('Running process discovery shell scan...');
-      const discovered = await detectProcesses();
-      cachedProcesses.clear();
-      for (const proc of discovered) {
-        if (proc.ports && proc.ports.length > 0) {
-          cachedProcesses.set(proc.pid, proc);
+      // 3. If target process is missing from cache or every 10th tick, perform a discovery shell scan (ps/lsof)
+      if (!targetProcess || tickCount % 10 === 0) {
+        autoResumer.log('Running process discovery shell scan...');
+        const discovered = await detectProcesses();
+        cachedProcesses.clear();
+        for (const proc of discovered) {
+          if (proc.ports && proc.ports.length > 0) {
+            cachedProcesses.set(proc.pid, proc);
+          }
         }
+        targetProcess = await findTargetWorkspaceProcess(discovered, currentWorkspaceFsPath);
       }
-      targetProcess = await findTargetWorkspaceProcess(discovered, currentWorkspaceFsPath);
     }
 
     tickCount++;
@@ -260,7 +312,23 @@ async function pollIntervalTick() {
     startupRetryCount = 0;
 
     autoResumer.log(`Processing PID ${targetProcess.pid} for current workspace (${targetProcess.workspaceId || 'global'})...`);
-    const credits = await queryCreditStatusForProcess(targetProcess);
+    let credits = await queryCreditStatusForProcess(targetProcess);
+
+    // If Tier 1 extension bridge port failed transiently, fallback once to Tier 2 OS process discovery
+    if (!credits) {
+      const discovered = await detectProcesses();
+      cachedProcesses.clear();
+      for (const proc of discovered) {
+        if (proc.ports && proc.ports.length > 0) {
+          cachedProcesses.set(proc.pid, proc);
+        }
+      }
+      const fallbackProcess = await findTargetWorkspaceProcess(discovered, currentWorkspaceFsPath);
+      if (fallbackProcess) {
+        targetProcess = fallbackProcess;
+        credits = await queryCreditStatusForProcess(targetProcess);
+      }
+    }
 
     if (credits) {
       reconnectRetryCount = 0;

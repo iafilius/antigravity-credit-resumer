@@ -1,6 +1,5 @@
-import * as https from 'https';
 import * as vscode from 'vscode';
-import { DetectedProcess, hasProcessOpenFileInWorkspace } from './process-detector';
+import { DetectedProcess, hasProcessOpenFileInWorkspace, postConnectRpc } from './process-detector';
 import { UserCreditsStatus, ModelQuotaInfo } from './credit-monitor';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -590,17 +589,19 @@ export class AutoResumer {
 
     for (const { id, traj } of candidateEntries) {
       const modTimeStr = traj?.lastModifiedTime || traj?.lastUserInputTime || traj?.trajectoryMetadata?.createdAt || '';
+      const candidateCascadeId = traj?.cascadeId || traj?.trajectoryMetadata?.rootConversationId || id || traj?.trajectoryId;
       if (modTimeStr) {
         const time = new Date(modTimeStr).getTime();
         if (time > maxTime) {
           maxTime = time;
-          activeTrajectoryId = traj?.trajectoryId || id;
+          activeTrajectoryId = candidateCascadeId;
         }
       }
     }
 
     if (!activeTrajectoryId) {
-      activeTrajectoryId = candidateEntries[0].traj?.trajectoryId || candidateEntries[0].id;
+      const first = candidateEntries[0];
+      activeTrajectoryId = first.traj?.cascadeId || first.traj?.trajectoryMetadata?.rootConversationId || first.id || first.traj?.trajectoryId;
     }
 
     if (activeTrajectoryId) {
@@ -661,118 +662,87 @@ export class AutoResumer {
     return false;
   }
 
-  private getAllTrajectories(proc: DetectedProcess): Promise<any | null> {
-    return new Promise((resolve) => {
-      const payload = JSON.stringify({
-        metadata: {
-          ideName: 'antigravity',
-          extensionName: 'antigravity',
-          locale: 'en',
-        },
-      });
-
-      // Try all candidate ports
-      let resolved = false;
-      for (const port of proc.ports) {
-        const options: https.RequestOptions = {
-          hostname: '127.0.0.1',
-          port: port,
-          path: '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories',
-          method: 'POST',
-          rejectUnauthorized: false,
-          headers: {
-            'Content-Type': 'application/json',
-            'Connect-Protocol-Version': '1',
-            'X-Codeium-Csrf-Token': proc.csrfToken,
-            'Content-Length': Buffer.byteLength(payload),
-          },
-          timeout: 2000,
-        };
-
-        const req = https.request(options, (res) => {
-          let data = '';
-          res.on('data', (chunk) => {
-            data += chunk;
-          });
-          res.on('end', () => {
-            if (res.statusCode === 200 && !resolved) {
-              resolved = true;
-              try {
-                resolve(JSON.parse(data));
-              } catch (e) {
-                resolve(null);
-              }
-            }
-          });
-        });
-
-        req.on('error', () => {});
-        req.write(payload);
-        req.end();
-      }
-
-      setTimeout(() => {
-        if (!resolved) {
-          resolve(null);
-        }
-      }, 2500);
+  private async getAllTrajectories(proc: DetectedProcess): Promise<any | null> {
+    const payload = JSON.stringify({
+      metadata: {
+        ideName: 'antigravity',
+        extensionName: 'antigravity',
+        locale: 'en',
+      },
     });
+
+    for (const port of proc.ports) {
+      const res = await postConnectRpc(
+        port,
+        proc.csrfToken,
+        '/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories',
+        payload,
+        2000
+      );
+      if (res && res.statusCode === 200 && res.body) {
+        try {
+          return JSON.parse(res.body);
+        } catch {
+          return null;
+        }
+      }
+    }
+    return null;
   }
 
-  private sendCascadeMessage(proc: DetectedProcess, trajectoryId: string, modelId: string, messageText: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      const payload = JSON.stringify({
-        message: messageText,
-        selectedCascadeId: trajectoryId,
-        requestedModel: {
-          model: modelId,
+  private async sendCascadeMessage(proc: DetectedProcess, trajectoryId: string, modelId: string, messageText: string): Promise<boolean> {
+    const modernPayload = JSON.stringify({
+      cascadeId: trajectoryId,
+      items: [{ text: messageText }],
+      cascadeConfig: {
+        plannerConfig: {
+          planModel: modelId,
         },
-        metadata: {
-          ideName: 'antigravity',
-          extensionName: 'antigravity',
-          locale: 'en',
-        },
-      });
-
-      // Send to ports
-      let resolved = false;
-      for (const port of proc.ports) {
-        const options: https.RequestOptions = {
-          hostname: '127.0.0.1',
-          port: port,
-          path: '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
-          method: 'POST',
-          rejectUnauthorized: false,
-          headers: {
-            'Content-Type': 'application/json',
-            'Connect-Protocol-Version': '1',
-            'X-Codeium-Csrf-Token': proc.csrfToken,
-            'Content-Length': Buffer.byteLength(payload),
-          },
-          timeout: 3000,
-        };
-
-        const req = https.request(options, (res) => {
-          res.on('data', () => {});
-          res.on('end', () => {
-            if (res.statusCode === 200 && !resolved) {
-              resolved = true;
-              resolve(true);
-            }
-          });
-        });
-
-        req.on('error', () => {});
-        req.write(payload);
-        req.end();
-      }
-
-      setTimeout(() => {
-        if (!resolved) {
-          resolve(false);
-        }
-      }, 3500);
+      },
+      metadata: {
+        ideName: 'antigravity',
+        extensionName: 'antigravity',
+        locale: 'en',
+      },
     });
+
+    for (const port of proc.ports) {
+      const res = await postConnectRpc(
+        port,
+        proc.csrfToken,
+        '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+        modernPayload,
+        3000
+      );
+      if (res && res.statusCode === 200) {
+        return true;
+      }
+      if (res && res.statusCode === 400) {
+        const legacyPayload = JSON.stringify({
+          message: messageText,
+          selectedCascadeId: trajectoryId,
+          requestedModel: {
+            model: modelId,
+          },
+          metadata: {
+            ideName: 'antigravity',
+            extensionName: 'antigravity',
+            locale: 'en',
+          },
+        });
+        const fallbackRes = await postConnectRpc(
+          port,
+          proc.csrfToken,
+          '/exa.language_server_pb.LanguageServerService/SendUserCascadeMessage',
+          legacyPayload,
+          3000
+        );
+        if (fallbackRes && fallbackRes.statusCode === 200) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 }
 
@@ -836,7 +806,11 @@ export function formatResetTime(resetTimeStr?: string, remainingFraction?: numbe
 export function getShortModelLabel(label: string): string {
   if (!label) return 'Unknown';
 
-  const versionMatch = label.match(/(\d+\.\d+)/);
+  if (label.includes('GPT-OSS')) {
+    return 'GPT-OSS';
+  }
+
+  const versionMatch = label.match(/(\d+(?:\.\d+)?)/);
   const version = versionMatch ? versionMatch[1] : '';
 
   let tier = '';
@@ -844,6 +818,9 @@ export function getShortModelLabel(label: string): string {
   else if (label.includes('(Medium)')) tier = '-M';
   else if (label.includes('(Low)')) tier = '-L';
 
+  if (label.includes('Argon')) {
+    return version ? `${version} Argon${tier}` : `Argon${tier}`;
+  }
   if (label.includes('Flash')) {
     return version ? `${version} Flash${tier}` : `Flash${tier}`;
   }
@@ -855,9 +832,6 @@ export function getShortModelLabel(label: string): string {
   }
   if (label.includes('Opus')) {
     return version ? `Opus ${version}` : 'Opus';
-  }
-  if (label.includes('GPT-OSS')) {
-    return 'GPT-OSS';
   }
 
   const cleaned = label.replace(/^(Gemini|Claude)\s+/i, '').trim();
@@ -876,29 +850,37 @@ export function findLatestWorkspaceTrajectoryOnDisk(
   workspaceFsPath?: string
 ): DiskTrajectoryInfo | null {
   try {
-    const brainDir = path.join(customHomeDir || os.homedir(), '.gemini', 'antigravity-ide', 'brain');
-    if (!fs.existsSync(brainDir)) return null;
-
-    const entries = fs.readdirSync(brainDir, { withFileTypes: true });
+    const baseHome = customHomeDir || os.homedir();
+    const brainDirs = [
+      path.join(baseHome, '.gemini', 'antigravity', 'brain'),
+      path.join(baseHome, '.gemini', 'antigravity-ide', 'brain'),
+    ];
     const candidates: DiskTrajectoryInfo[] = [];
 
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith('.') || entry.name.includes('media') || entry.name.includes('scratch')) continue;
+    for (const brainDir of brainDirs) {
+      if (!fs.existsSync(brainDir)) continue;
 
-      const dirPath = path.join(brainDir, entry.name);
-      const candidateFiles = ['transcript.jsonl', 'transcript_full.jsonl'];
-      for (const fileName of candidateFiles) {
-        const transcriptPath = path.join(dirPath, '.system_generated', 'logs', fileName);
-        try {
-          if (fs.existsSync(transcriptPath)) {
-            const stat = fs.statSync(transcriptPath);
-            candidates.push({ id: entry.name, mtime: stat.mtimeMs, transcriptPath });
-            break;
-          }
-        } catch (e) {}
+      const entries = fs.readdirSync(brainDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith('.') || entry.name.includes('media') || entry.name.includes('scratch')) continue;
+
+        const dirPath = path.join(brainDir, entry.name);
+        const candidateFiles = ['transcript.jsonl', 'transcript_full.jsonl'];
+        for (const fileName of candidateFiles) {
+          const transcriptPath = path.join(dirPath, '.system_generated', 'logs', fileName);
+          try {
+            if (fs.existsSync(transcriptPath)) {
+              const stat = fs.statSync(transcriptPath);
+              candidates.push({ id: entry.name, mtime: stat.mtimeMs, transcriptPath });
+              break;
+            }
+          } catch (e) {}
+        }
       }
     }
+
+    if (candidates.length === 0) return null;
 
     // Sort newest transcript file first
     candidates.sort((a, b) => b.mtime - a.mtime);
@@ -978,12 +960,23 @@ export function matchesWorkspace(procWorkspaceId: string | undefined, traj: any,
 export function isCurrentWorkspaceProcess(proc: DetectedProcess, currentWorkspaceFsPath?: string): boolean {
   if (!currentWorkspaceFsPath) {
     // If no workspace folder is open, match global or any process without a workspaceId
-    return !proc.workspaceId || proc.workspaceId.toLowerCase() === 'global';
+    return (!proc.workspaceId || proc.workspaceId.toLowerCase() === 'global') && (!proc.workspacePaths || proc.workspacePaths.length === 0);
   }
-  if (!proc.workspaceId) return false;
   const currentNorm = normalizeWorkspaceString(currentWorkspaceFsPath);
+  if (!currentNorm) return false;
+
+  if (proc.workspacePaths && proc.workspacePaths.length > 0) {
+    for (const wp of proc.workspacePaths) {
+      const wpNorm = normalizeWorkspaceString(wp);
+      if (wpNorm && (currentNorm.includes(wpNorm) || wpNorm.includes(currentNorm))) {
+        return true;
+      }
+    }
+  }
+
+  if (!proc.workspaceId) return false;
   const procNorm = normalizeWorkspaceString(proc.workspaceId);
-  return currentNorm.includes(procNorm) || procNorm.includes(currentNorm);
+  return Boolean(procNorm && (currentNorm.includes(procNorm) || procNorm.includes(currentNorm)));
 }
 
 export async function findTargetWorkspaceProcess(
@@ -1002,10 +995,10 @@ export async function findTargetWorkspaceProcess(
 
   if (!currentWorkspaceFsPath) {
     // If no workspace folder is open, match global or process without workspaceId
-    return activeWithPorts.find(p => !p.workspaceId || p.workspaceId.toLowerCase() === 'global') || activeWithPorts[0];
+    return activeWithPorts.find(p => (!p.workspaceId || p.workspaceId.toLowerCase() === 'global') && (!p.workspacePaths || p.workspacePaths.length === 0)) || activeWithPorts[0];
   }
 
-  // 2. Exact / substring Workspace string matching
+  // 2. Exact / substring Workspace string or `--add-dir` path matching
   const exactMatch = activeWithPorts.find(p => isCurrentWorkspaceProcess(p, currentWorkspaceFsPath));
   if (exactMatch) {
     return exactMatch;
@@ -1020,11 +1013,15 @@ export async function findTargetWorkspaceProcess(
   }
 
   // 4. Elimination Fallback:
-  // If all other processes explicitly match different known workspaces (e.g. file_Users_arjan_personal_<other>),
+  // If all other processes explicitly match different known workspaces (e.g. file_Users_arjan_personal_<other> or --add-dir=/other),
   // and there is an unassigned process with a hex/unmapped workspaceId, pick it.
   const otherWorkspaces = activeWithPorts.filter(p => {
-    if (!p.workspaceId) return false;
-    return p.workspaceId.startsWith('file_') && !isCurrentWorkspaceProcess(p, currentWorkspaceFsPath);
+    const hasExplicitPath = Boolean(
+      (p.workspacePaths && p.workspacePaths.length > 0) ||
+      (p.workspaceId && (p.workspaceId.startsWith('file_') || p.workspaceId.startsWith('/')))
+    );
+    if (!hasExplicitPath) return false;
+    return !isCurrentWorkspaceProcess(p, currentWorkspaceFsPath);
   });
 
   const unassigned = activeWithPorts.filter(p => !otherWorkspaces.includes(p));
@@ -1161,12 +1158,19 @@ export function mapModelLabelToModelId(label: string, models: ModelQuotaInfo[] =
 export function selectDeterministicDefaultModel(credits: UserCreditsStatus): string {
   if (!credits.models || credits.models.length === 0) return '';
 
-  // 1. If language server provided an explicit non-placeholder default, respect it
+  // 1. If language server provided an explicit non-placeholder default, or a placeholder default
+  // whose resolved model label is a (Medium) default (e.g. Gemini 4 Argon (Medium)), respect it
   const staticDefault = credits.rawResponse?.userStatus?.cascadeModelConfigData?.defaultOverrideModelConfig?.modelOrAlias?.model || '';
-  if (staticDefault && !staticDefault.startsWith('MODEL_PLACEHOLDER_')) {
+  if (staticDefault) {
     const matching = credits.models.find(m => m.model === staticDefault || m.modelId === staticDefault);
-    if (matching?.model) return matching.model;
-    return staticDefault;
+    if (!staticDefault.startsWith('MODEL_PLACEHOLDER_')) {
+      if (matching?.model) return matching.model;
+      return staticDefault;
+    }
+    const matchingLabel = (matching?.label || '').toLowerCase();
+    if (matching?.model && matchingLabel.includes('argon') && matchingLabel.includes('medium')) {
+      return matching.model;
+    }
   }
 
   // 2. Prioritize standard Antigravity IDE default: Gemini Flash (Medium)
