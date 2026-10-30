@@ -10,6 +10,18 @@ let activityChannel: vscode.OutputChannel | undefined;
 let debugChannel: vscode.OutputChannel | undefined;
 let autoResumer: AutoResumer | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
+let currentExtensionPath: string | undefined;
+
+function hasAntigravityHostPresence(): boolean {
+  try {
+    return Boolean(
+      vscode.extensions?.getExtension?.('google.google-antigravity') ||
+      vscode.extensions?.getExtension?.('google.antigravity')
+    );
+  } catch {
+    return false;
+  }
+}
 
 // In-memory cache to store discovered language server processes and resolved ports
 const cachedProcesses = new Map<number, DetectedProcess>();
@@ -62,7 +74,8 @@ export async function resolveWindowProcessFromAgyExtension(currentWorkspaceFsPat
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  const version = context.extension?.packageJSON?.version || '0.8.0';
+  const version = context.extension?.packageJSON?.version || '0.8.1';
+  currentExtensionPath = context.extensionPath;
 
   // Create separated output channels
   activityChannel = vscode.window.createOutputChannel('Antigravity Credit Resumer Activity');
@@ -284,10 +297,10 @@ async function pollIntervalTick() {
 
     if (!targetProcess) {
       autoResumer.log(`No active Antigravity Language Server process found matching workspace: ${currentWorkspaceFsPath || 'global'}`);
-      autoResumer.handleApiDark();
 
       // Schedule rapid sub-second retry if we are below max retries on startup (10 retries at 500ms)
       if (startupRetryCount < 10) {
+        autoResumer.handleApiDark();
         startupRetryCount++;
         autoResumer.log(`Scheduling rapid startup retry ${startupRetryCount}/10 in 500ms...`);
         if (startupRetryTimer) clearTimeout(startupRetryTimer);
@@ -297,6 +310,8 @@ async function pollIntervalTick() {
         }, 500);
       } else if (reconnectRetryCount < 3) {
         // Mid-session rapid reconnection retry (3 retries at 3000ms)
+        autoResumer.handleApiDark();
+        autoResumer.evaluateDiskVersionGuard(currentExtensionPath);
         reconnectRetryCount++;
         autoResumer.log(`Scheduling rapid reconnect retry ${reconnectRetryCount}/3 in 3000ms...`);
         if (reconnectRetryTimer) clearTimeout(reconnectRetryTimer);
@@ -304,6 +319,15 @@ async function pollIntervalTick() {
           reconnectRetryTimer = undefined;
           pollIntervalTick();
         }, 3000);
+      } else {
+        if (hasAntigravityHostPresence()) {
+          autoResumer.handleSchemaDrift(
+            'Antigravity IDE is active, but neither google.google-antigravity exports nor OS process CLI flags matched expected format after 3 retries'
+          );
+        } else {
+          autoResumer.handleApiDark();
+        }
+        autoResumer.evaluateDiskVersionGuard(currentExtensionPath);
       }
       return;
     }
@@ -337,13 +361,15 @@ async function pollIntervalTick() {
         reconnectRetryTimer = undefined;
       }
       await autoResumer.processTick(targetProcess, credits, currentWorkspaceFsPath);
+      autoResumer.evaluateDiskVersionGuard(currentExtensionPath);
     } else {
       autoResumer.log(`Failed to query credits for PID ${targetProcess.pid} on ports: ${targetProcess.ports.join(', ')}${autoResumer.isWaitingForRefill(targetProcess.pid) ? ' [REFILL WAIT]' : ''}`);
-      autoResumer.handleApiDark(targetProcess);
       // Evict failed process from cache so next tick performs rediscovery
       cachedProcesses.delete(targetProcess.pid);
 
       if (reconnectRetryCount < 3) {
+        autoResumer.handleApiDark(targetProcess);
+        autoResumer.evaluateDiskVersionGuard(currentExtensionPath);
         reconnectRetryCount++;
         autoResumer.log(`Scheduling rapid credit query retry ${reconnectRetryCount}/3 in 3000ms...`);
         if (reconnectRetryTimer) clearTimeout(reconnectRetryTimer);
@@ -351,6 +377,12 @@ async function pollIntervalTick() {
           reconnectRetryTimer = undefined;
           pollIntervalTick();
         }, 3000);
+      } else {
+        autoResumer.handleSchemaDrift(
+          `Process PID ${targetProcess.pid} is running, but GetUserStatus failed across all ports (${targetProcess.ports.join(', ')}) after 3 retries`,
+          targetProcess
+        );
+        autoResumer.evaluateDiskVersionGuard(currentExtensionPath);
       }
     }
   } catch (err: any) {

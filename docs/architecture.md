@@ -48,6 +48,8 @@ Before any request is sent, the extension must locate the running Antigravity se
 * **Port & Protocol Resolution**: `postConnectRpc()` supports both HTTPS (self-signed TLS) and plain HTTP (`--hub-port` on `127.0.0.1`), automatically falling back from HTTPS to HTTP on TLS/socket error.
 * **Caching**: Process information (PID, CSRF token, resolved ports) is cached in-memory in [extension.ts](../src/extension.ts). The extension performs a fast verification tick and only spawns process scanning shell commands if the cache is empty or every fourth tick to minimize CPU overhead.
 * **Survival Sweeps**: Cached processes are only evicted if `process.kill(pid, 0)` returns `ESRCH` (process not found). `EPERM` errors from permission-restricted processes do **not** trigger eviction.
+* **Proactive Schema & Protocol Drift Guard (`SCHEMA_DRIFT`)**: `validateUserStatusSchema()` verifies the structural contract of `GetUserStatus` responses. If the IDE changes its RPC JSON structure, returns HTTP 400/404/501, or fails process/port binding across 3 consecutive ticks while Antigravity is active, the extension transitions from `API_DARK` (`Reconnecting...`) to `SCHEMA_DRIFT` (`$(warning) AGY: IDE Changed — Update Needed` with error background) and emits a one-time diagnostic warning toast.
+* **On-Disk Version Watcher & Self-Healing Reload**: `evaluateDiskVersionGuard()` compares the running in-memory extension version against `~/.antigravity-ide/extensions/`. If a newer version is installed on disk while the window is in `API_DARK` or `SCHEMA_DRIFT`, it automatically triggers `workbench.action.restartExtensionHost` so open windows self-heal without manual reload.
 
 ### 2. Credit and Quota Monitoring
 

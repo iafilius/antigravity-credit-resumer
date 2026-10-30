@@ -14,7 +14,58 @@ export type ResumerOperationalState =
   | 'REFILL_DETECTED'
   | 'DISPATCHING_RESUME'
   | 'RESUMING'
-  | 'API_DARK';
+  | 'API_DARK'
+  | 'SCHEMA_DRIFT'
+  | 'RELOAD_REQUIRED';
+
+export function compareSemver(v1: string, v2: string): number {
+  const parts1 = v1.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const parts2 = v2.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const a = parts1[i] || 0;
+    const b = parts2[i] || 0;
+    if (a > b) return 1;
+    if (a < b) return -1;
+  }
+  return 0;
+}
+
+export function detectNewerInstalledVersion(
+  currentVersion: string,
+  extensionPath?: string,
+  customExtensionsDir?: string
+): string | null {
+  try {
+    const extDir = customExtensionsDir
+      || (extensionPath ? path.dirname(extensionPath) : path.join(os.homedir(), '.antigravity-ide', 'extensions'));
+    if (!fs.existsSync(extDir)) return null;
+
+    let obsoleteMap: Record<string, boolean> = {};
+    const obsoletePath = path.join(extDir, '.obsolete');
+    if (fs.existsSync(obsoletePath)) {
+      try {
+        obsoleteMap = JSON.parse(fs.readFileSync(obsoletePath, 'utf8')) || {};
+      } catch {}
+    }
+
+    let highestVersion = currentVersion;
+    const entries = fs.readdirSync(extDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (obsoleteMap[entry.name]) continue;
+      const match = entry.name.match(/^(?:arjan\.)?antigravity-credit-resumer-(\d+\.\d+\.\d+)/i);
+      if (match && match[1]) {
+        if (compareSemver(match[1], highestVersion) > 0) {
+          highestVersion = match[1];
+        }
+      }
+    }
+
+    return compareSemver(highestVersion, currentVersion) > 0 ? highestVersion : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface ResumptionEventInfo {
   timestamp: string;
@@ -46,6 +97,10 @@ export class AutoResumer {
   private lastPollTime: number = Date.now();
   private pollIntervalMs: number = 60000;
   private currentOperationalState: ResumerOperationalState = 'INITIALIZING';
+  private notifiedSchemaDriftReasons = new Set<string>();
+  private notifiedReloadVersions = new Set<string>();
+  private hasAttemptedAutoRestart = false;
+  private pendingDiskVersion: string | null = null;
 
   constructor(activityChannel: vscode.OutputChannel, debugChannel: vscode.OutputChannel, statusBarItem?: vscode.StatusBarItem, extensionVersion: string = '0.7.7') {
     this.activityChannel = activityChannel;
@@ -106,6 +161,98 @@ export class AutoResumer {
     }
   }
 
+  public handleSchemaDrift(reason: string, proc?: DetectedProcess) {
+    this.setOperationalState('SCHEMA_DRIFT', proc);
+    this.log(`Schema/protocol drift detected: ${reason}`);
+    this.activityChannel.appendLine(`[AutoResumer] ⚠️ SCHEMA/PROTOCOL DRIFT: ${reason}`);
+
+    if (!this.notifiedSchemaDriftReasons.has(reason)) {
+      this.notifiedSchemaDriftReasons.add(reason);
+      const now = new Date().toLocaleString();
+      appendToLogFile(
+        'resumer-history.md',
+        `| \`${proc?.pid ?? process.pid}\` | \`${now}\` | **Schema/Protocol Drift** | ${reason} | Update Needed |\n`
+      );
+      const showNotifications = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showNotifications', true);
+      if (showNotifications && typeof vscode.window.showWarningMessage === 'function') {
+        vscode.window.showWarningMessage(
+          `[AGY Resumer] Antigravity IDE structure or protocol changed: ${reason}. A new antigravity-credit-resumer release may be required.`,
+          'Show Logs'
+        ).then((selection) => {
+          if (selection === 'Show Logs') {
+            vscode.commands.executeCommand('antigravityCreditResumer.showActivity');
+          }
+        });
+      }
+    }
+
+    if (this.statusBarItem) {
+      const showStatusBar = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showStatusBar', true);
+      if (showStatusBar) {
+        this.statusBarItem.text = `$(warning) AGY: IDE Changed — Update Needed`;
+        this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+        const nextPollMs = Math.max(0, (this.lastPollTime + this.pollIntervalMs) - Date.now());
+        const nextPollSec = Math.ceil(nextPollMs / 1000);
+
+        const tooltip = new vscode.MarkdownString(
+          `**Antigravity Credit Auto-Resumer (v${this.extensionVersion})**\n\n` +
+          `### ⚠️ Auto-Resumer Alert: [SCHEMA_DRIFT / UPDATE_NEEDED]\n` +
+          `• **Current State**: 🔴 Incompatible IDE Data Structure or Protocol Detected\n` +
+          `• **Diagnostic Reason**: ${reason}\n` +
+          `• **Next Check**: in ~${nextPollSec}s (interval: ${this.pollIntervalMs / 1000}s)\n` +
+          `• **Action Plan**: Update or rebuild \`antigravity-credit-resumer\` to match the new Antigravity IDE release.\n\n` +
+          `---\n\n` +
+          `👉 [Open Activity Logs](command:antigravityCreditResumer.showActivity) | [🔄 Rebuild & Update](command:antigravityCreditResumer.developerUpdate) | *v${this.extensionVersion}*`
+        );
+        tooltip.isTrusted = true;
+        this.statusBarItem.tooltip = tooltip;
+        this.statusBarItem.show();
+      }
+    }
+  }
+
+  public evaluateDiskVersionGuard(extensionPath?: string, customExtensionsDir?: string): string | null {
+    const newerVersion = detectNewerInstalledVersion(this.extensionVersion, extensionPath, customExtensionsDir);
+    this.pendingDiskVersion = newerVersion;
+    if (!newerVersion) {
+      return null;
+    }
+
+    const state = this.currentOperationalState;
+    if (state === 'API_DARK' || state === 'SCHEMA_DRIFT') {
+      if (!this.hasAttemptedAutoRestart) {
+        this.hasAttemptedAutoRestart = true;
+        const msg = `[AutoResumer] 🔄 Newer version v${newerVersion} detected on disk while in ${state} (running v${this.extensionVersion}). Auto-restarting Extension Host...`;
+        this.activityChannel.appendLine(msg);
+        this.log(msg);
+        try {
+          vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+        } catch {}
+      }
+      return newerVersion;
+    }
+
+    if (!this.notifiedReloadVersions.has(newerVersion)) {
+      this.notifiedReloadVersions.add(newerVersion);
+      this.activityChannel.appendLine(
+        `[AutoResumer] 🔄 Newer version v${newerVersion} is installed on disk (running v${this.extensionVersion} in memory).`
+      );
+      const showNotifications = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('showNotifications', true);
+      if (showNotifications) {
+        vscode.window.showInformationMessage(
+          `[AGY Resumer] Version v${newerVersion} is installed on disk (running v${this.extensionVersion} in memory). Restart Extension Host to activate.`,
+          'Restart Extension Host'
+        )?.then(selection => {
+          if (selection === 'Restart Extension Host') {
+            vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+          }
+        });
+      }
+    }
+
+    return newerVersion;
+  }
+
   public log(msg: string) {
     const debug = vscode.workspace.getConfiguration('antigravityCreditResumer').get<boolean>('debugLogging', false);
     if (debug) {
@@ -121,6 +268,11 @@ export class AutoResumer {
   }
 
   public async processTick(proc: DetectedProcess, credits: UserCreditsStatus, currentWorkspaceFsPath?: string) {
+    if (credits.schemaDriftReason) {
+      this.handleSchemaDrift(credits.schemaDriftReason, proc);
+      return;
+    }
+
     const config = vscode.workspace.getConfiguration('antigravityCreditResumer');
     const mode = config.get<string>('modelSelectionMode', 'stick');
     const resumePrompt = config.get<string>('resumePrompt', 'continue');
@@ -515,6 +667,9 @@ export class AutoResumer {
     const lastResumedLine = state.lastResumedInfo
       ? `• **Last Resumption**: 🚀 Sent prompt "${state.lastResumedInfo.prompt}" to \`${state.lastResumedInfo.trajectoryId.substring(0, 8)}\` (${getShortModelLabel(state.lastResumedInfo.modelId)}) at ${state.lastResumedInfo.timestamp} (${state.lastResumedInfo.success ? 'Success' : 'Failed'})\n`
       : '';
+    const diskUpdateLine = this.pendingDiskVersion
+      ? `• **Update Ready on Disk**: 🔄 **v${this.pendingDiskVersion}** installed (running v${this.extensionVersion} in memory — restart Extension Host)\n`
+      : '';
 
     const planSection =
       `### ⏱ Auto-Resumer Plan: [${state.currentState}]\n` +
@@ -523,6 +678,7 @@ export class AutoResumer {
       `• **Target Refill Window**: ${resetStr}\n` +
       `• **Active Trajectory**: ${resumeReadyStr}\n` +
       `${lastResumedLine}` +
+      `${diskUpdateLine}` +
       `• **Action Plan**: ${statePlan}\n\n`;
 
     const tooltip = new vscode.MarkdownString(

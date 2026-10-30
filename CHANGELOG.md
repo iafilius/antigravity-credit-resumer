@@ -4,6 +4,12 @@ All notable changes to the Antigravity Credit Auto-Resumer extension are documen
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.1] — 2026-10-30
+
+### Added
+- **Proactive Schema & Protocol Drift Detection (`SCHEMA_DRIFT` State)**: Added structural schema validation (`validateUserStatusSchema`) in `src/credit-monitor.ts` and `handleSchemaDrift(reason)` in `src/auto-resumer.ts`. When `GetUserStatus` returns HTTP 400/404/501 or HTTP 200 with a modified JSON structure (missing `userStatus` or `clientModelConfigs`), or when Antigravity IDE is active but process/port binding fails across 3 consecutive retries, the status bar transitions from `Reconnecting...` to `$(warning) AGY: IDE Changed — Update Needed` with `statusBarItem.errorBackground`, detailed tooltip diagnostics, and a one-time actionable warning toast notification.
+- **On-Disk Extension Version Watcher & Self-Healing Reload Guard**: Added `detectNewerInstalledVersion()` and `evaluateDiskVersionGuard()` to compare the running in-memory extension version against installed `arjan.antigravity-credit-resumer-*` directories on disk (`~/.antigravity-ide/extensions/`). Automatically triggers `workbench.action.restartExtensionHost` when a newer version is installed on disk while stuck in `API_DARK` or `SCHEMA_DRIFT`, or offers a one-time `Restart Extension Host` notification when healthy.
+
 ## [0.8.0] — 2026-10-30
 
 ### Added
